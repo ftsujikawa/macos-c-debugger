@@ -26,6 +26,8 @@ int  cdbg_regs_get(pid_t pid, cdbg_regs_t *regs);
 int  cdbg_regs_set(pid_t pid, const cdbg_regs_t *regs);
 void cdbg_regs_print(const cdbg_regs_t *regs);
 uintptr_t cdbg_regs_pc(const cdbg_regs_t *regs);
+uintptr_t cdbg_regs_fp(const cdbg_regs_t *regs);
 int cdbg_regs_set_pc(cdbg_regs_t *regs, uintptr_t pc);
+int cdbg_regs_frame_up(pid_t pid, cdbg_regs_t *regs);
 
 #endif /* CDBG_REGS_H */

@@ -150,6 +150,27 @@ int cdbg_step_next_line(cdbg_t *dbg)
     return -1;
 }
 
+int cdbg_frame_up(cdbg_t *dbg)
+{
+    if (cdbg_refresh_regs(dbg) != 0) {
+        return -1;
+    }
+
+    if (cdbg_regs_frame_up(dbg->pid, &dbg->regs) != 0) {
+        fputs("Cannot unwind to caller frame\n", stderr);
+        return -1;
+    }
+
+    if (cdbg_regs_set(dbg->pid, &dbg->regs) != 0) {
+        return -1;
+    }
+
+    uintptr_t pc = cdbg_regs_pc(&dbg->regs);
+    printf("Now at caller frame (pc=0x%lx)\n", (unsigned long)pc);
+    cdbg_lineno_print_source_at_pc(&dbg->lineno, pc);
+    return 0;
+}
+
 int cdbg_refresh_regs(cdbg_t *dbg)
 {
     return cdbg_regs_get(dbg->pid, &dbg->regs);
@@ -234,6 +255,7 @@ static void print_help(void)
     puts("  continue | c          Resume execution");
     puts("  step | s              Single-step one instruction");
     puts("  next | n              Step to next source line");
+    puts("  up                    Stop at caller frame");
     puts("  regs | r              Print registers");
     puts("  break <addr|name|line> | b  Set breakpoint");
     puts("  lists [file]          List source line to address mappings");
@@ -416,6 +438,8 @@ int cdbg_repl(cdbg_t *dbg)
             if (cdbg_step_next_line(dbg) != 0) {
                 return dbg->state == CDBG_STATE_IDLE ? 0 : -1;
             }
+        } else if (strcmp(cmd, "up") == 0) {
+            (void)cdbg_frame_up(dbg);
         } else if (strcmp(cmd, "regs") == 0 || strcmp(cmd, "r") == 0) {
             if (cdbg_refresh_regs(dbg) != 0) {
                 return -1;

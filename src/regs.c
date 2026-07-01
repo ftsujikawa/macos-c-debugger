@@ -3,6 +3,8 @@
 #include <mach/mach.h>
 #include <stdio.h>
 
+#include "memory.h"
+
 static mach_port_t task_for_traced_pid(pid_t pid)
 {
     mach_port_t task = MACH_PORT_NULL;
@@ -106,6 +108,91 @@ int cdbg_regs_set_pc(cdbg_regs_t *regs, uintptr_t pc)
     regs->native.__rip = pc;
 #endif
     return 0;
+}
+
+uintptr_t cdbg_regs_fp(const cdbg_regs_t *regs)
+{
+#if defined(__aarch64__)
+    return (uintptr_t)regs->native.__fp;
+#elif defined(__x86_64__)
+    return (uintptr_t)regs->native.__rbp;
+#endif
+}
+
+static int ret_addr_valid(uint64_t addr)
+{
+    return addr >= 0x1000;
+}
+
+static int unwind_from_stack_top(pid_t pid, cdbg_regs_t *regs, uintptr_t sp)
+{
+#if defined(__aarch64__)
+    uint64_t ret_addr = regs->native.__lr;
+    if (!ret_addr_valid(ret_addr)) {
+        return -1;
+    }
+    if (cdbg_regs_set_pc(regs, (uintptr_t)ret_addr) != 0) {
+        return -1;
+    }
+    uintptr_t fp = cdbg_regs_fp(regs);
+    if (fp != 0) {
+        uint64_t saved_fp = 0;
+        if (cdbg_mem_read_u64(pid, fp, &saved_fp) == 0 && saved_fp > fp) {
+            regs->native.__fp = saved_fp;
+        }
+    }
+    regs->native.__sp = sp + 16;
+#elif defined(__x86_64__)
+    uint64_t ret_addr = 0;
+    if (cdbg_mem_read_u64(pid, sp, &ret_addr) != 0 || !ret_addr_valid(ret_addr)) {
+        return -1;
+    }
+    if (cdbg_regs_set_pc(regs, (uintptr_t)ret_addr) != 0) {
+        return -1;
+    }
+    regs->native.__rsp = sp + 8;
+#endif
+    return 0;
+}
+
+int cdbg_regs_frame_up(pid_t pid, cdbg_regs_t *regs)
+{
+    uintptr_t fp = cdbg_regs_fp(regs);
+#if defined(__aarch64__)
+    uintptr_t sp = (uintptr_t)regs->native.__sp;
+#elif defined(__x86_64__)
+    uintptr_t sp = (uintptr_t)regs->native.__rsp;
+#endif
+
+#if defined(__x86_64__)
+    uint8_t insn = 0;
+    uintptr_t pc = cdbg_regs_pc(regs);
+    if (cdbg_mem_read(pid, pc, &insn, 1) == 0 && insn == 0x55) {
+        return unwind_from_stack_top(pid, regs, sp);
+    }
+#endif
+
+    if (fp != 0) {
+        uint64_t saved_fp = 0;
+        uint64_t ret_addr = 0;
+        if (cdbg_mem_read_u64(pid, fp, &saved_fp) == 0 &&
+            cdbg_mem_read_u64(pid, fp + 8, &ret_addr) == 0 &&
+            saved_fp > fp && ret_addr_valid(ret_addr)) {
+            if (cdbg_regs_set_pc(regs, (uintptr_t)ret_addr) != 0) {
+                return -1;
+            }
+#if defined(__aarch64__)
+            regs->native.__fp = saved_fp;
+            regs->native.__sp = fp + 16;
+#elif defined(__x86_64__)
+            regs->native.__rbp = saved_fp;
+            regs->native.__rsp = fp + 16;
+#endif
+            return 0;
+        }
+    }
+
+    return unwind_from_stack_top(pid, regs, sp);
 }
 
 void cdbg_regs_print(const cdbg_regs_t *regs)

@@ -37,6 +37,7 @@ int  cdbg_wait(cdbg_t *dbg);
 int  cdbg_continue(cdbg_t *dbg);
 int  cdbg_single_step(cdbg_t *dbg);
 int  cdbg_step_next_line(cdbg_t *dbg);
+int  cdbg_frame_up(cdbg_t *dbg);
 int  cdbg_refresh_regs(cdbg_t *dbg);
 void cdbg_print_regs(const cdbg_t *dbg);
 void cdbg_print_stop_context(cdbg_t *dbg);
