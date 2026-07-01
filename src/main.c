@@ -1,7 +1,10 @@
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "debugger.h"
+#include "process.h"
 
 static void usage(const char *prog)
 {
@@ -16,13 +19,35 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    char program[PATH_MAX];
+    if (cdbg_resolve_program(argv[1], program, sizeof(program)) != 0) {
+        fprintf(stderr, "cdbg: invalid program path: %s\n", argv[1]);
+        return EXIT_FAILURE;
+    }
+
+    char *spawn_argv[256];
+    if (argc > (int)(sizeof(spawn_argv) / sizeof(spawn_argv[0]))) {
+        fprintf(stderr, "cdbg: too many arguments\n");
+        return EXIT_FAILURE;
+    }
+    size_t spawn_argc = 0;
+    spawn_argv[spawn_argc++] = program;
+    for (int i = 2; i < argc; i++) {
+        spawn_argv[spawn_argc++] = argv[i];
+    }
+    spawn_argv[spawn_argc] = NULL;
+
     cdbg_t dbg;
     if (cdbg_init(&dbg) != 0) {
         return EXIT_FAILURE;
     }
 
-    if (cdbg_spawn(&dbg, &argv[1]) != 0) {
+    if (cdbg_spawn(&dbg, spawn_argv) != 0) {
         return EXIT_FAILURE;
+    }
+
+    if (cdbg_load_symbols(&dbg, program) != 0) {
+        fprintf(stderr, "Warning: could not load debug info for %s\n", program);
     }
 
     if (cdbg_wait(&dbg) != 0) {
@@ -30,10 +55,7 @@ int main(int argc, char *argv[])
     }
 
     printf("Attached to pid %d (initial stop)\n", dbg.pid);
-
-    if (cdbg_refresh_regs(&dbg) != 0) {
-        return EXIT_FAILURE;
-    }
+    cdbg_print_stop_context(&dbg);
 
     if (cdbg_repl(&dbg) != 0) {
         return EXIT_FAILURE;

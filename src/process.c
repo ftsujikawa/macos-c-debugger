@@ -1,12 +1,49 @@
 #include "process.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+int cdbg_resolve_program(const char *name, char *out, size_t out_len)
+{
+    if (name == NULL || out == NULL || out_len == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (strchr(name, '/') != NULL) {
+        if (snprintf(out, out_len, "%s", name) >= (int)out_len) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        return 0;
+    }
+
+    char cwd_path[PATH_MAX];
+    if (snprintf(cwd_path, sizeof(cwd_path), "./%s", name) >= (int)sizeof(cwd_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (access(cwd_path, X_OK) == 0) {
+        if (snprintf(out, out_len, "%s", cwd_path) >= (int)out_len) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        return 0;
+    }
+
+    if (snprintf(out, out_len, "%s", name) >= (int)out_len) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
 
 int cdbg_process_spawn(pid_t *child_pid, char *const argv[])
 {
@@ -27,8 +64,8 @@ int cdbg_process_spawn(pid_t *child_pid, char *const argv[])
             _exit(127);
         }
 
-        execvp(argv[0], argv);
-        perror("execvp");
+        execv(argv[0], argv);
+        perror(argv[0]);
         _exit(127);
     }
 
