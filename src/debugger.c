@@ -86,6 +86,39 @@ int cdbg_spawn(cdbg_t *dbg, char *const argv[])
     return 0;
 }
 
+static cdbg_breakpoint_t *disabled_breakpoint_at_pc(cdbg_t *dbg, uintptr_t pc)
+{
+    for (size_t i = 0; i < dbg->breakpoint_count; i++) {
+        cdbg_breakpoint_t *bp = &dbg->breakpoints[i];
+        if (!bp->enabled && bp->addr == pc) {
+            return bp;
+        }
+    }
+    return NULL;
+}
+
+static int reenable_breakpoints_after_step(cdbg_t *dbg)
+{
+    if (dbg->breakpoint_count == 0 || dbg->state != CDBG_STATE_STOPPED) {
+        return 0;
+    }
+
+    if (cdbg_refresh_regs(dbg) != 0) {
+        return -1;
+    }
+
+    uintptr_t pc = cdbg_regs_pc(&dbg->regs);
+    for (size_t i = 0; i < dbg->breakpoint_count; i++) {
+        cdbg_breakpoint_t *bp = &dbg->breakpoints[i];
+        if (!bp->enabled && bp->addr != pc) {
+            if (cdbg_bp_enable(bp, dbg->pid, bp->addr) != 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 int cdbg_wait(cdbg_t *dbg)
 {
     if (cdbg_process_wait(dbg->pid, &dbg->wait_status) != 0) {
@@ -98,11 +131,43 @@ int cdbg_wait(cdbg_t *dbg)
     }
 
     dbg->state = CDBG_STATE_STOPPED;
+    if (reenable_breakpoints_after_step(dbg) != 0) {
+        return -1;
+    }
     return 0;
+}
+
+static int step_over_disabled_breakpoint(cdbg_t *dbg)
+{
+    if (dbg->state != CDBG_STATE_STOPPED || dbg->breakpoint_count == 0) {
+        return 0;
+    }
+
+    if (cdbg_refresh_regs(dbg) != 0) {
+        return -1;
+    }
+
+    uintptr_t pc = cdbg_regs_pc(&dbg->regs);
+    if (disabled_breakpoint_at_pc(dbg, pc) == NULL) {
+        return 0;
+    }
+
+    if (cdbg_single_step(dbg) != 0) {
+        return -1;
+    }
+    return cdbg_wait(dbg);
 }
 
 int cdbg_continue(cdbg_t *dbg)
 {
+    int step_rc = step_over_disabled_breakpoint(dbg);
+    if (step_rc != 0) {
+        return step_rc;
+    }
+    if (dbg->state == CDBG_STATE_IDLE) {
+        return 0;
+    }
+
     if (ptrace(PT_CONTINUE, dbg->pid, (caddr_t)1, 0) == -1) {
         perror("ptrace(PT_CONTINUE)");
         return -1;
@@ -185,6 +250,10 @@ static int step_over_call(cdbg_t *dbg, uintptr_t return_addr)
     if (cdbg_continue(dbg) != 0) {
         (void)cdbg_bp_disable(&temp_bp, dbg->pid);
         return -1;
+    }
+    if (dbg->state == CDBG_STATE_IDLE) {
+        (void)cdbg_bp_disable(&temp_bp, dbg->pid);
+        return 0;
     }
     if (cdbg_wait(dbg) != 0) {
         (void)cdbg_bp_disable(&temp_bp, dbg->pid);
@@ -1639,6 +1708,9 @@ int cdbg_repl(cdbg_t *dbg)
         } else if (strcmp(cmd, "continue") == 0 || strcmp(cmd, "c") == 0) {
             if (cdbg_continue(dbg) != 0) {
                 return -1;
+            }
+            if (dbg->state == CDBG_STATE_IDLE) {
+                return 0;
             }
             if (cdbg_wait(dbg) != 0) {
                 return dbg->state == CDBG_STATE_IDLE ? 0 : -1;
