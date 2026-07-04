@@ -1113,10 +1113,11 @@ static bool file_matches(const char *entry_file, const char *filter)
     }
     const char *base = strrchr(entry_file, '/');
     base = base != NULL ? base + 1 : entry_file;
-  return strstr(entry_file, filter) != NULL || strcmp(base, filter) == 0;
+    return strstr(entry_file, filter) != NULL || strcmp(base, filter) == 0;
 }
 
 #define CDBG_SOURCE_CONTEXT 3
+#define CDBG_LIST_SOURCE_LINES 10
 
 static FILE *lineno_open_source(const cdbg_lineno_t *ln, const char *path)
 {
@@ -1146,6 +1147,50 @@ static FILE *lineno_open_source(const cdbg_lineno_t *ln, const char *path)
     const char *base = strrchr(path, '/');
     base = (base != NULL) ? base + 1 : path;
     return fopen(base, "r");
+}
+
+static int lineno_print_source_window(const cdbg_lineno_t *ln, const char *file,
+                                      uint32_t target, uint32_t total_lines)
+{
+    FILE *fp = lineno_open_source(ln, file);
+    if (fp == NULL) {
+        fprintf(stderr, "Cannot read source: %s\n", file);
+        return -1;
+    }
+
+    uint32_t before = total_lines / 2;
+    uint32_t start = (target > before) ? target - before : 1;
+    uint32_t end = start + total_lines - 1;
+
+    printf("\n%s:%u\n", file, target);
+
+    char buf[4096];
+    uint32_t line_no = 0;
+    bool printed_target = false;
+    while (fgets(buf, sizeof(buf), fp) != NULL) {
+        line_no++;
+        if (line_no < start) {
+            continue;
+        }
+        if (line_no > end) {
+            break;
+        }
+
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+            buf[--len] = '\0';
+        }
+
+        const char *marker = (line_no == target) ? ">" : " ";
+        if (line_no == target) {
+            printed_target = true;
+        }
+        printf("%s%4u | %s\n", marker, line_no, buf);
+    }
+
+    fclose(fp);
+    putchar('\n');
+    return printed_target ? 0 : -1;
 }
 
 static const cdbg_line_entry_t *lineno_entry_at_pc(const cdbg_lineno_t *ln,
@@ -1184,47 +1229,82 @@ int cdbg_lineno_line_at_pc(const cdbg_lineno_t *ln, uintptr_t runtime_pc,
     return 0;
 }
 
-void cdbg_lineno_print_source_at_pc(const cdbg_lineno_t *ln, uintptr_t runtime_pc)
+const cdbg_line_entry_t *cdbg_lineno_lookup_next_line_after_pc(const cdbg_lineno_t *ln,
+                                                               uintptr_t runtime_pc)
+{
+    const cdbg_line_entry_t *current = cdbg_lineno_lookup_pc(ln, runtime_pc);
+    if (current == NULL) {
+        return NULL;
+    }
+
+    const cdbg_line_entry_t *next = NULL;
+    for (size_t i = 0; i < ln->count; i++) {
+        const cdbg_line_entry_t *entry = &ln->entries[i];
+        uintptr_t addr = cdbg_lineno_runtime_addr(ln, entry->address);
+        if (addr <= runtime_pc) {
+            continue;
+        }
+        if (strcmp(entry->file, current->file) != 0 || entry->line == current->line) {
+            continue;
+        }
+        if (next == NULL || entry->address < next->address) {
+            next = entry;
+        }
+    }
+
+    return next;
+}
+
+int cdbg_lineno_print_source_at_pc(const cdbg_lineno_t *ln, uintptr_t runtime_pc)
 {
     const cdbg_line_entry_t *entry = lineno_entry_at_pc(ln, runtime_pc);
     if (entry == NULL) {
-        return;
+        return -1;
     }
 
-    FILE *fp = lineno_open_source(ln, entry->file);
-    if (fp == NULL) {
-        fprintf(stderr, "Cannot read source: %s\n", entry->file);
-        return;
+    return lineno_print_source_window(ln, entry->file, entry->line,
+                                      CDBG_SOURCE_CONTEXT * 2 + 1);
+}
+
+int cdbg_lineno_print_source_at_line(const cdbg_lineno_t *ln,
+                                     const char *file_filter,
+                                     uint32_t line)
+{
+    if (ln->count == 0) {
+        fputs("No line number information loaded\n", stderr);
+        return -1;
     }
 
-    uint32_t target = entry->line;
-    uint32_t start = (target > CDBG_SOURCE_CONTEXT) ? target - CDBG_SOURCE_CONTEXT : 1;
-    uint32_t end = target + CDBG_SOURCE_CONTEXT;
-
-    printf("\n%s:%u\n", entry->file, target);
-
-    char buf[4096];
-    uint32_t line_no = 0;
-    while (fgets(buf, sizeof(buf), fp) != NULL) {
-        line_no++;
-        if (line_no < start) {
+    const char *matched_file = NULL;
+    for (size_t i = 0; i < ln->count; i++) {
+        const cdbg_line_entry_t *entry = &ln->entries[i];
+        if (!file_matches(entry->file, file_filter)) {
             continue;
         }
-        if (line_no > end) {
-            break;
+        if (matched_file == NULL) {
+            matched_file = entry->file;
+            continue;
         }
-
-        size_t len = strlen(buf);
-        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
-            buf[--len] = '\0';
+        if (strcmp(matched_file, entry->file) != 0) {
+            if (file_filter == NULL || file_filter[0] == '\0') {
+                fprintf(stderr, "Line %u is ambiguous; use file:line\n", line);
+            } else {
+                fprintf(stderr, "File filter is ambiguous: %s\n", file_filter);
+            }
+            return -1;
         }
-
-        const char *marker = (line_no == target) ? ">" : " ";
-        printf("%s%4u | %s\n", marker, line_no, buf);
     }
 
-    fclose(fp);
-    putchar('\n');
+    if (matched_file == NULL) {
+        if (file_filter == NULL || file_filter[0] == '\0') {
+            fprintf(stderr, "No source file for line %u\n", line);
+        } else {
+            fprintf(stderr, "No source file matches: %s\n", file_filter);
+        }
+        return -1;
+    }
+
+    return lineno_print_source_window(ln, matched_file, line, CDBG_LIST_SOURCE_LINES);
 }
 
 void cdbg_lineno_print_list(const cdbg_lineno_t *ln, const char *file_filter)

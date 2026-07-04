@@ -12,6 +12,7 @@
 
 #define CDBG_MAX_BREAKPOINTS 64
 #define CDBG_MAX_CMD         256
+#define CDBG_MAX_PATH        1024
 
 typedef enum {
     CDBG_STATE_IDLE,
@@ -28,6 +29,8 @@ typedef struct cdbg {
     size_t breakpoint_count;
     cdbg_lineno_t lineno;
     cdbg_syms_t syms;
+    char executable_path[CDBG_MAX_PATH];
+    char debug_info_path[CDBG_MAX_PATH];
 } cdbg_t;
 
 int  cdbg_init(cdbg_t *dbg);
@@ -37,6 +40,7 @@ int  cdbg_wait(cdbg_t *dbg);
 int  cdbg_continue(cdbg_t *dbg);
 int  cdbg_single_step(cdbg_t *dbg);
 int  cdbg_step_next_line(cdbg_t *dbg);
+int  cdbg_next_source_line(cdbg_t *dbg);
 int  cdbg_frame_up(cdbg_t *dbg);
 int  cdbg_refresh_regs(cdbg_t *dbg);
 void cdbg_print_regs(const cdbg_t *dbg);
