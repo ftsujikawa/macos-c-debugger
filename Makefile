@@ -11,7 +11,8 @@ SRCS = src/main.c \
        src/memory.c \
        src/regs.c \
        src/lineno.c \
-       src/syms.c
+       src/syms.c \
+       src/expr.c
 
 OBJS = $(SRCS:src/%.c=build/%.o)
 TARGET = build/cdbg

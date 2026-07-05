@@ -42,20 +42,13 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    if (cdbg_spawn(&dbg, spawn_argv) != 0) {
+    if (cdbg_set_run_target(&dbg, spawn_argv) != 0) {
         return EXIT_FAILURE;
     }
 
-    if (cdbg_load_symbols(&dbg, program) != 0) {
-        fprintf(stderr, "Warning: could not load debug info for %s\n", program);
-    }
-
-    if (cdbg_wait(&dbg) != 0) {
+    if (cdbg_run(&dbg, NULL) != 0) {
         return EXIT_FAILURE;
     }
-
-    printf("Attached to pid %d (initial stop)\n", dbg.pid);
-    cdbg_print_stop_context(&dbg);
 
     if (cdbg_repl(&dbg) != 0) {
         return EXIT_FAILURE;

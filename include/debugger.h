@@ -13,6 +13,7 @@
 #define CDBG_MAX_BREAKPOINTS 64
 #define CDBG_MAX_CMD         256
 #define CDBG_MAX_PATH        1024
+#define CDBG_MAX_RUN_ARGS    64
 
 typedef enum {
     CDBG_STATE_IDLE,
@@ -31,9 +32,14 @@ typedef struct cdbg {
     cdbg_syms_t syms;
     char executable_path[CDBG_MAX_PATH];
     char debug_info_path[CDBG_MAX_PATH];
+    char run_argv_storage[CDBG_MAX_RUN_ARGS][CDBG_MAX_PATH];
+    char *run_argv[CDBG_MAX_RUN_ARGS + 1];
+    size_t run_argc;
 } cdbg_t;
 
 int  cdbg_init(cdbg_t *dbg);
+int  cdbg_set_run_target(cdbg_t *dbg, char *const argv[]);
+int  cdbg_run(cdbg_t *dbg, char *const argv[]);
 int  cdbg_load_symbols(cdbg_t *dbg, const char *executable_path);
 int  cdbg_spawn(cdbg_t *dbg, char *const argv[]);
 int  cdbg_wait(cdbg_t *dbg);
