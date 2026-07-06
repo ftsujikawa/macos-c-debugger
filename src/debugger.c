@@ -3473,6 +3473,12 @@ static const cdbg_help_entry_t k_help_entries[] = {
     },
     {
         "Inspection",
+        "lines",
+        "lines [file]",
+        "List line number to address mappings.",
+    },
+    {
+        "Inspection",
         "lists",
         "lists [file]",
         "List source line to address mappings.",
@@ -3767,6 +3773,12 @@ static int cmd_dis(cdbg_t *dbg, const char *target)
     return 0;
 }
 
+static int cmd_lines(cdbg_t *dbg, const char *file_filter)
+{
+    cdbg_lineno_print_list(&dbg->lineno, file_filter);
+    return 0;
+}
+
 static int cmd_list(cdbg_t *dbg, char *target)
 {
     if (target == NULL || trim_space(target)[0] == '\0') {
@@ -4049,6 +4061,9 @@ int cdbg_repl(cdbg_t *dbg)
         } else if (strcmp(cmd, "list") == 0 || strcmp(cmd, "l") == 0) {
             char *target = strtok(NULL, "\n");
             (void)cmd_list(dbg, target);
+        } else if (strcmp(cmd, "lines") == 0) {
+            char *file_filter = strtok(NULL, " \t");
+            (void)cmd_lines(dbg, file_filter);
         } else if (strcmp(cmd, "lists") == 0) {
             char *file_filter = strtok(NULL, " \t");
             cdbg_lineno_print_list(&dbg->lineno, file_filter);
