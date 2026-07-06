@@ -21,6 +21,21 @@ typedef enum {
     CDBG_STATE_STOPPED,
 } cdbg_state_t;
 
+typedef enum {
+    CDBG_LANG_AUTO,
+    CDBG_LANG_C,
+    CDBG_LANG_CXX,
+    CDBG_LANG_OBJC,
+    CDBG_LANG_FORTRAN,
+    CDBG_LANG_PASCAL,
+    CDBG_LANG_ADA,
+    CDBG_LANG_MODULA2,
+    CDBG_LANG_JAVA,
+    CDBG_LANG_GO,
+    CDBG_LANG_RUST,
+    CDBG_LANG_ASSEMBLY,
+} cdbg_language_t;
+
 typedef struct cdbg {
     pid_t pid;
     cdbg_state_t state;
@@ -35,7 +50,15 @@ typedef struct cdbg {
     char run_argv_storage[CDBG_MAX_RUN_ARGS][CDBG_MAX_PATH];
     char *run_argv[CDBG_MAX_RUN_ARGS + 1];
     size_t run_argc;
+    bool print_pretty;
+    cdbg_language_t language;
 } cdbg_t;
+
+int           cdbg_language_parse(const char *name, cdbg_language_t *out);
+const char   *cdbg_language_name(cdbg_language_t lang);
+cdbg_language_t cdbg_language_effective(const cdbg_t *dbg);
+bool          cdbg_language_supports_expr(cdbg_language_t lang);
+int           cdbg_language_check_expr(const cdbg_t *dbg);
 
 int  cdbg_init(cdbg_t *dbg);
 int  cdbg_set_run_target(cdbg_t *dbg, char *const argv[]);

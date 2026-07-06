@@ -671,6 +671,10 @@ int cdbg_expr_eval(cdbg_t *dbg, const char *text, cdbg_expr_result_t *out)
         return -1;
     }
 
+    if (cdbg_language_check_expr(dbg) != 0) {
+        return -1;
+    }
+
     if (cdbg_refresh_regs(dbg) != 0) {
         return -1;
     }
