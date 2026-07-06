@@ -2769,7 +2769,8 @@ static int cmd_print(cdbg_t *dbg, char *expr)
     }
 
     print_scalar_result_fmt(dbg, expr, fmt, result.value, sizeof(uint64_t), true,
-                            false, result.is_address, NULL);
+                            false, result.is_address,
+                            result.type[0] != '\0' ? result.type : NULL);
     return 0;
 }
 

@@ -585,6 +585,26 @@ static int parse_primary(parser_t *p, cdbg_expr_result_t *out)
     return -1;
 }
 
+static void make_pointer_type(const char *base_type, char *out, size_t out_len)
+{
+    if (base_type == NULL || base_type[0] == '\0') {
+        out[0] = '\0';
+        return;
+    }
+
+    size_t len = strlen(base_type);
+    while (len > 0 && base_type[len - 1] == ' ') {
+        len--;
+    }
+
+    if (len >= out_len - 3) {
+        len = out_len - 4;
+    }
+    memcpy(out, base_type, len);
+    out[len] = '\0';
+    snprintf(out + len, out_len - len, " *");
+}
+
 static int parse_unary_address(parser_t *p, cdbg_expr_result_t *out)
 {
     advance(p);
@@ -607,6 +627,7 @@ static int parse_unary_address(parser_t *p, cdbg_expr_result_t *out)
     (void)found_local;
     out->value = addr;
     out->is_address = true;
+    make_pointer_type(var.type, out->type, sizeof(out->type));
     return 0;
 }
 
