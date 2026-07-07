@@ -51,6 +51,7 @@ typedef struct cdbg {
     char *run_argv[CDBG_MAX_RUN_ARGS + 1];
     size_t run_argc;
     bool print_pretty;
+    bool malloc_stack_logging;
     cdbg_language_t language;
 } cdbg_t;
 

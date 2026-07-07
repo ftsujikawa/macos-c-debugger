@@ -406,7 +406,7 @@ int cdbg_spawn(cdbg_t *dbg, char *const argv[])
 {
     pid_t pid;
 
-    if (cdbg_process_spawn(&pid, argv) != 0) {
+    if (cdbg_process_spawn(&pid, argv, dbg->malloc_stack_logging) != 0) {
         return -1;
     }
 
@@ -3088,11 +3088,29 @@ static int cmd_set_print(cdbg_t *dbg, char *args)
     return -1;
 }
 
+static int cmd_set_malloc_log(cdbg_t *dbg, char *args)
+{
+    args = trim_space(args);
+    if (strcmp(args, "on") == 0) {
+        dbg->malloc_stack_logging = true;
+        puts("Malloc stack logging is on. Takes effect on the next 'run'.");
+        return 0;
+    }
+    if (strcmp(args, "off") == 0) {
+        dbg->malloc_stack_logging = false;
+        puts("Malloc stack logging is off.");
+        return 0;
+    }
+
+    fputs("Usage: set malloc-log on|off\n", stderr);
+    return -1;
+}
+
 static int cmd_set(cdbg_t *dbg, char *args)
 {
     if (args == NULL) {
         fputs("Usage: set <var> <expr> | set print pretty on|off | "
-              "set language <name>\n", stderr);
+              "set language <name> | set malloc-log on|off\n", stderr);
         return -1;
     }
 
@@ -3105,12 +3123,15 @@ static int cmd_set(cdbg_t *dbg, char *args)
     if (strncmp(trimmed, "language ", 9) == 0) {
         return cmd_set_language(dbg, trimmed + 9);
     }
+    if (strncmp(trimmed, "malloc-log ", 11) == 0) {
+        return cmd_set_malloc_log(dbg, trimmed + 11);
+    }
 
     char *lhs = NULL;
     char *rhs = NULL;
     if (split_assignment(trimmed, &lhs, &rhs) != 0) {
         fputs("Usage: set <var> <expr> | set print pretty on|off | "
-              "set language <name>\n", stderr);
+              "set language <name> | set malloc-log on|off\n", stderr);
         return -1;
     }
 
@@ -3404,6 +3425,42 @@ static int cmd_show(cdbg_t *dbg, char *args)
     return 0;
 }
 
+static int cmd_leaks(cdbg_t *dbg)
+{
+    if (dbg->pid <= 0 || dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running\n", stderr);
+        return -1;
+    }
+
+    if (!dbg->malloc_stack_logging) {
+        puts("Note: 'set malloc-log on' before 'run' to get allocation "
+             "backtraces in the report below.");
+    }
+
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "leaks %d 2>&1", (int)dbg->pid);
+
+    fflush(stdout);
+    FILE *fp = popen(cmd, "r");
+    if (fp == NULL) {
+        perror("popen(leaks)");
+        return -1;
+    }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        fputs(line, stdout);
+    }
+
+    int status = pclose(fp);
+    if (status != 0) {
+        fputs("Could not run the 'leaks' tool. It requires Xcode command line "
+              "tools and permission to inspect this process.\n", stderr);
+        return -1;
+    }
+    return 0;
+}
+
 typedef struct {
     const char *category;
     const char *names;
@@ -3521,6 +3578,13 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "Show a backtrace of the current call stack.",
     },
     {
+        "Inspection",
+        "leaks",
+        "leaks",
+        "Run the macOS 'leaks' tool against the debuggee to report unreachable "
+        "malloc blocks.",
+    },
+    {
         "Breakpoints",
         "show",
         "show bp",
@@ -3555,6 +3619,13 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "set language",
         "set language <name>",
         "Set the expression language (c, c++, auto, fortran, ...).",
+    },
+    {
+        "Settings",
+        "set malloc-log",
+        "set malloc-log on|off",
+        "Enable MallocStackLogging for the debuggee so 'leaks' can show "
+        "allocation backtraces. Takes effect on the next 'run'.",
     },
 };
 
@@ -4180,6 +4251,8 @@ int cdbg_repl(cdbg_t *dbg)
             (void)cmd_show(dbg, args);
         } else if (strcmp(cmd, "tb") == 0) {
             (void)cmd_backtrace(dbg);
+        } else if (strcmp(cmd, "leaks") == 0) {
+            (void)cmd_leaks(dbg);
         } else if (strcmp(cmd, "break") == 0 || strcmp(cmd, "b") == 0) {
             char *addr_text = strtok(NULL, " \t");
             if (addr_text == NULL) {

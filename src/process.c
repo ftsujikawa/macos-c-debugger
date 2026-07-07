@@ -45,7 +45,7 @@ int cdbg_resolve_program(const char *name, char *out, size_t out_len)
     return 0;
 }
 
-int cdbg_process_spawn(pid_t *child_pid, char *const argv[])
+int cdbg_process_spawn(pid_t *child_pid, char *const argv[], bool malloc_stack_logging)
 {
     if (argv == NULL || argv[0] == NULL) {
         errno = EINVAL;
@@ -62,6 +62,10 @@ int cdbg_process_spawn(pid_t *child_pid, char *const argv[])
         if (ptrace(PT_TRACE_ME, 0, NULL, 0) == -1) {
             perror("ptrace(PT_TRACE_ME)");
             _exit(127);
+        }
+
+        if (malloc_stack_logging) {
+            setenv("MallocStackLogging", "1", 1);
         }
 
         execv(argv[0], argv);

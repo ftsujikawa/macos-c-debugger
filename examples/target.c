@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 
 struct foo {
     int a;
@@ -45,6 +46,9 @@ int main(void)
     printf("target: psa[2].b=%d\n", psa[2].b);
 
     printf("rec=%d¥n", recursive_add(10, 10));
+
+    void *leaked = NULL;
+    leaked = malloc(100);
 
     volatile int x = 0;
     for (int i = 0; i < 3; i++) {
