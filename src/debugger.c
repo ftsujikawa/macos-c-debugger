@@ -2957,6 +2957,30 @@ static int resolve_lvalue(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
     return 0;
 }
 
+int cdbg_resolve_lvalue_expr(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
+                             char *type_out, size_t type_out_len)
+{
+    if (dbg == NULL || expr == NULL || addr_out == NULL) {
+        return -1;
+    }
+
+    size_t size = 0;
+    bool is_signed = false;
+    bool whole_struct = false;
+    char type_buf[128] = {0};
+    if (resolve_lvalue(dbg, expr, addr_out, &size, &is_signed, type_buf, sizeof(type_buf),
+                       &whole_struct) != 0) {
+        return -1;
+    }
+
+    if (type_out != NULL && type_out_len > 0) {
+        snprintf(type_out, type_out_len, "%s", type_buf);
+    }
+    (void)is_signed;
+    (void)whole_struct;
+    return 0;
+}
+
 static int resolve_set_lhs(cdbg_t *dbg, char *lhs, uintptr_t *addr_out,
                            size_t *size_out, bool *signed_out)
 {
@@ -3504,6 +3528,12 @@ static const cdbg_help_entry_t k_help_entries[] = {
     },
     {
         "Breakpoints",
+        "del, delete",
+        "del <n> [n...] | del all",
+        "Delete one or more breakpoints by number.",
+    },
+    {
+        "Breakpoints",
         "break, b",
         "break <addr|name|file:line|line>",
         "Set a breakpoint at an address, symbol, or source line.",
@@ -3842,6 +3872,107 @@ static int cmd_list(cdbg_t *dbg, char *target)
     return cdbg_lineno_print_source_at_line(&dbg->lineno, file, line);
 }
 
+static int delete_breakpoint_at(cdbg_t *dbg, size_t index)
+{
+    if (index >= dbg->breakpoint_count) {
+        fprintf(stderr, "No breakpoint number %zu\n", index);
+        return -1;
+    }
+
+    cdbg_breakpoint_t *bp = &dbg->breakpoints[index];
+    if (dbg->pid > 0 && dbg->state != CDBG_STATE_IDLE) {
+        if (cdbg_bp_disable(bp, dbg->pid) != 0) {
+            return -1;
+        }
+    } else {
+        bp->enabled = false;
+    }
+
+    for (size_t i = index + 1; i < dbg->breakpoint_count; i++) {
+        dbg->breakpoints[i - 1] = dbg->breakpoints[i];
+    }
+    dbg->breakpoint_count--;
+    memset(&dbg->breakpoints[dbg->breakpoint_count], 0, sizeof(cdbg_breakpoint_t));
+    return 0;
+}
+
+static int cmd_del(cdbg_t *dbg, char *args)
+{
+    if (dbg->breakpoint_count == 0) {
+        puts("No breakpoints.");
+        return 0;
+    }
+
+    if (args == NULL) {
+        fputs("Usage: del <n> [n...] | del all\n", stderr);
+        return -1;
+    }
+
+    args = trim_space(args);
+    if (args[0] == '\0') {
+        fputs("Usage: del <n> [n...] | del all\n", stderr);
+        return -1;
+    }
+
+    if (strcmp(args, "all") == 0) {
+        while (dbg->breakpoint_count > 0) {
+            if (delete_breakpoint_at(dbg, dbg->breakpoint_count - 1) != 0) {
+                return -1;
+            }
+        }
+        puts("All breakpoints deleted.");
+        return 0;
+    }
+
+    size_t indices[CDBG_MAX_BREAKPOINTS];
+    size_t index_count = 0;
+    char work[CDBG_MAX_CMD];
+    snprintf(work, sizeof(work), "%s", args);
+
+    for (char *token = strtok(work, " \t"); token != NULL;
+         token = strtok(NULL, " \t")) {
+        uint64_t number = 0;
+        if (parse_u64(token, &number) != 0) {
+            fprintf(stderr, "Invalid breakpoint number: %s\n", token);
+            return -1;
+        }
+        if (number >= dbg->breakpoint_count) {
+            fprintf(stderr, "No breakpoint number %llu\n",
+                    (unsigned long long)number);
+            return -1;
+        }
+
+        bool duplicate = false;
+        for (size_t i = 0; i < index_count; i++) {
+            if (indices[i] == (size_t)number) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            indices[index_count++] = (size_t)number;
+        }
+    }
+
+    for (size_t i = 0; i < index_count; i++) {
+        for (size_t j = i + 1; j < index_count; j++) {
+            if (indices[j] > indices[i]) {
+                size_t tmp = indices[i];
+                indices[i] = indices[j];
+                indices[j] = tmp;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < index_count; i++) {
+        printf("Deleting breakpoint %zu\n", indices[i]);
+        if (delete_breakpoint_at(dbg, indices[i]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int cmd_break(cdbg_t *dbg, const char *target)
 {
     uintptr_t addr = 0;
@@ -4056,6 +4187,9 @@ int cdbg_repl(cdbg_t *dbg)
             } else {
                 (void)cmd_break(dbg, addr_text);
             }
+        } else if (strcmp(cmd, "del") == 0 || strcmp(cmd, "delete") == 0) {
+            char *args = strtok(NULL, "\n");
+            (void)cmd_del(dbg, args);
         } else if (strcmp(cmd, "dis") == 0) {
             char *target = strtok(NULL, "\n");
             (void)cmd_dis(dbg, target);

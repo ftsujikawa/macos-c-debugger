@@ -59,6 +59,8 @@ const char   *cdbg_language_name(cdbg_language_t lang);
 cdbg_language_t cdbg_language_effective(const cdbg_t *dbg);
 bool          cdbg_language_supports_expr(cdbg_language_t lang);
 int           cdbg_language_check_expr(const cdbg_t *dbg);
+int           cdbg_resolve_lvalue_expr(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
+                                       char *type_out, size_t type_out_len);
 
 int  cdbg_init(cdbg_t *dbg);
 int  cdbg_set_run_target(cdbg_t *dbg, char *const argv[]);

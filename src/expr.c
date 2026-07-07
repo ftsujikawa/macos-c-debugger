@@ -36,6 +36,10 @@ typedef enum {
     TOK_NE,
     TOK_ANDAND,
     TOK_OROR,
+    TOK_DOT,
+    TOK_ARROW,
+    TOK_LBRACKET,
+    TOK_RBRACKET,
 } tok_type_t;
 
 typedef struct {
@@ -104,8 +108,18 @@ static token_t read_token(parser_t *p)
 
     const char *start = p->cursor;
     switch (*p->cursor) {
+    case '-':
+        if (p->cursor[1] == '>') {
+            tok.type = TOK_ARROW;
+            p->cursor += 2;
+            return tok;
+        }
+        tok.type = TOK_MINUS;
+        break;
+    case '.': tok.type = TOK_DOT; break;
+    case '[': tok.type = TOK_LBRACKET; break;
+    case ']': tok.type = TOK_RBRACKET; break;
     case '+': tok.type = TOK_PLUS; break;
-    case '-': tok.type = TOK_MINUS; break;
     case '*': tok.type = TOK_STAR; break;
     case '/': tok.type = TOK_SLASH; break;
     case '%': tok.type = TOK_PERCENT; break;
@@ -605,29 +619,108 @@ static void make_pointer_type(const char *base_type, char *out, size_t out_len)
     snprintf(out + len, out_len - len, " *");
 }
 
+static int lvalue_expr_append(char *expr, size_t expr_len, size_t *pos, const char *text)
+{
+    if (text == NULL) {
+        return 0;
+    }
+
+    int n = snprintf(expr + *pos, expr_len - *pos, "%s", text);
+    if (n < 0 || (size_t)n >= expr_len - *pos) {
+        return -1;
+    }
+    *pos += (size_t)n;
+    return 0;
+}
+
+static int parse_lvalue_path(parser_t *p, char *expr_out, size_t expr_len)
+{
+    if (p->current.type != TOK_IDENT) {
+        fputs("Expected lvalue expression\n", stderr);
+        return -1;
+    }
+
+    size_t pos = 0;
+    if (lvalue_expr_append(expr_out, expr_len, &pos, p->current.ident) != 0) {
+        return -1;
+    }
+    advance(p);
+
+    for (;;) {
+        if (accept(p, TOK_DOT)) {
+            if (p->current.type != TOK_IDENT) {
+                fputs("Expected member name after '.'\n", stderr);
+                return -1;
+            }
+            if (lvalue_expr_append(expr_out, expr_len, &pos, ".") != 0 ||
+                lvalue_expr_append(expr_out, expr_len, &pos, p->current.ident) != 0) {
+                return -1;
+            }
+            advance(p);
+            continue;
+        }
+
+        if (accept(p, TOK_ARROW)) {
+            if (p->current.type != TOK_IDENT) {
+                fputs("Expected member name after '->'\n", stderr);
+                return -1;
+            }
+            if (lvalue_expr_append(expr_out, expr_len, &pos, "->") != 0 ||
+                lvalue_expr_append(expr_out, expr_len, &pos, p->current.ident) != 0) {
+                return -1;
+            }
+            advance(p);
+            continue;
+        }
+
+        if (accept(p, TOK_LBRACKET)) {
+            if (p->current.type != TOK_NUMBER) {
+                fputs("Expected array index\n", stderr);
+                return -1;
+            }
+            char index_buf[32];
+            snprintf(index_buf, sizeof(index_buf), "[%llu]",
+                     (unsigned long long)p->current.number);
+            if (lvalue_expr_append(expr_out, expr_len, &pos, index_buf) != 0) {
+                return -1;
+            }
+            advance(p);
+            if (!expect(p, TOK_RBRACKET)) {
+                fputs("Expected ']'\n", stderr);
+                return -1;
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    expr_out[pos] = '\0';
+    return pos > 0 ? 0 : -1;
+}
+
 static int parse_unary_address(parser_t *p, cdbg_expr_result_t *out)
 {
     advance(p);
-    if (p->current.type != TOK_IDENT) {
+
+    char expr[256];
+    if (parse_lvalue_path(p, expr, sizeof(expr)) != 0) {
         fputs("Cannot take address of expression\n", stderr);
         return -1;
     }
 
-    char name[128];
-    snprintf(name, sizeof(name), "%s", p->current.ident);
-    advance(p);
-
-    cdbg_var_info_t var = {0};
+    char work[256];
+    snprintf(work, sizeof(work), "%s", expr);
     uintptr_t addr = 0;
-    bool found_local = false;
-    if (resolve_variable_address(p->dbg, name, &var, &addr, &found_local) != 0) {
-        fprintf(stderr, "Unknown variable: %s\n", name);
+    char value_type[128] = {0};
+    if (cdbg_resolve_lvalue_expr(p->dbg, work, &addr, value_type, sizeof(value_type)) != 0) {
+        fprintf(stderr, "Unknown lvalue: %s\n", expr);
         return -1;
     }
-    (void)found_local;
+
     out->value = addr;
     out->is_address = true;
-    make_pointer_type(var.type, out->type, sizeof(out->type));
+    make_pointer_type(value_type, out->type, sizeof(out->type));
     return 0;
 }
 

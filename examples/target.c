@@ -11,6 +11,14 @@ static int add_values(int a, int b)
     return a + b;
 }
 
+int recursive_add(int a, int b)
+{
+    if (b == 0) {
+        return a;
+    }
+    return recursive_add(a + 1, b - 1);
+}
+
 int main(void)
 {
     struct foo f = {
@@ -35,6 +43,8 @@ int main(void)
     printf("target: psa[1].b=%d\n", psa[1].b);
     printf("target: psa[2].a=%d\n", psa[2].a);
     printf("target: psa[2].b=%d\n", psa[2].b);
+
+    printf("rec=%d¥n", recursive_add(10, 10));
 
     volatile int x = 0;
     for (int i = 0; i < 3; i++) {
