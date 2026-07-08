@@ -48,6 +48,7 @@ int main(void)
     printf("rec=%d¥n", recursive_add(10, 10));
 
     void *leaked = NULL;
+    free(leaked);
     leaked = malloc(100);
 
     volatile int x = 0;
@@ -55,5 +56,11 @@ int main(void)
         x = add_values(x, i);
     }
     printf("target: x=%d\n", x);
+
+    int i = 0;
+    while(1) {
+        printf("result = %d\n", i++);
+    }
+
     return 0;
 }

@@ -59,6 +59,8 @@ int cdbg_process_spawn(pid_t *child_pid, char *const argv[], bool malloc_stack_l
     }
 
     if (pid == 0) {
+        setpgid(0, 0);
+
         if (ptrace(PT_TRACE_ME, 0, NULL, 0) == -1) {
             perror("ptrace(PT_TRACE_ME)");
             _exit(127);
@@ -79,7 +81,12 @@ int cdbg_process_spawn(pid_t *child_pid, char *const argv[], bool malloc_stack_l
 
 int cdbg_process_wait(pid_t pid, int *status)
 {
-    if (waitpid(pid, status, 0) == -1) {
+    int ret;
+    do {
+        ret = waitpid(pid, status, 0);
+    } while (ret == -1 && errno == EINTR);
+
+    if (ret == -1) {
         perror("waitpid");
         return -1;
     }

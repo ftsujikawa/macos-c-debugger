@@ -1,8 +1,10 @@
 #include "debugger.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <libgen.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +20,16 @@
 static int report_stop(cdbg_t *dbg);
 static void report_process_exit(cdbg_t *dbg);
 static void print_stop_location(cdbg_t *dbg, uintptr_t pc);
+
+static cdbg_t *g_sigint_dbg = NULL;
+
+static void sigint_handler(int sig)
+{
+    (void)sig;
+    if (g_sigint_dbg != NULL && g_sigint_dbg->state == CDBG_STATE_RUNNING) {
+        kill(g_sigint_dbg->pid, SIGINT);
+    }
+}
 
 static int debugger_dsym_path(const char *executable_path, char *out, size_t out_len)
 {
@@ -4146,10 +4158,22 @@ int cdbg_repl(cdbg_t *dbg)
 {
     char line[CDBG_MAX_CMD];
 
+    g_sigint_dbg = dbg;
+    signal(SIGINT, sigint_handler);
+
     puts("Type 'help' for available commands.");
 
-    while (fputs("cdbg> ", stdout), fflush(stdout),
-           fgets(line, sizeof(line), stdin) != NULL) {
+    for (;;) {
+        fputs("cdbg> ", stdout);
+        fflush(stdout);
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            if (ferror(stdin) && errno == EINTR) {
+                clearerr(stdin);
+                putchar('\n');
+                continue;
+            }
+            break;
+        }
         char *newline = strchr(line, '\n');
         if (newline != NULL) {
             *newline = '\0';
@@ -4287,14 +4311,7 @@ int cdbg_repl(cdbg_t *dbg)
                 (void)cmd_examine(dbg, addr_text, count_text);
             }
         } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0) {
-            if (dbg->state != CDBG_STATE_IDLE && dbg->pid > 0) {
-                for (size_t i = 0; i < dbg->breakpoint_count; i++) {
-                    if (dbg->breakpoints[i].enabled) {
-                        (void)cdbg_bp_disable(&dbg->breakpoints[i], dbg->pid);
-                    }
-                }
-                ptrace(PT_DETACH, dbg->pid, (caddr_t)1, 0);
-            }
+            (void)stop_debuggee(dbg);
             cdbg_lineno_free(&dbg->lineno);
             cdbg_syms_free(&dbg->syms);
             return 0;
