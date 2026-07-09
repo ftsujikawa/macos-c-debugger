@@ -45,11 +45,15 @@ int main(void)
     printf("target: psa[2].a=%d\n", psa[2].a);
     printf("target: psa[2].b=%d\n", psa[2].b);
 
-    printf("rec=%d¥n", recursive_add(10, 10));
+    printf("rec=%d\n", recursive_add(10, 10));
 
     void *leaked = NULL;
     free(leaked);
     leaked = malloc(100);
+
+    for (int i = 0; i < 10; i++) {
+        leaked = malloc(100);
+    }
 
     volatile int x = 0;
     for (int i = 0; i < 3; i++) {
