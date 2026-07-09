@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <libgen.h>
 #include <limits.h>
+#include <mach/mach.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@
 
 static int report_stop(cdbg_t *dbg);
 static void report_process_exit(cdbg_t *dbg);
+static void print_stop_header(const cdbg_t *dbg);
 static void print_stop_location(cdbg_t *dbg, uintptr_t pc);
 
 static cdbg_t *g_sigint_dbg = NULL;
@@ -291,6 +293,7 @@ static int run_to_entry_stop(cdbg_t *dbg)
                 return -1;
             }
         }
+        print_stop_header(dbg);
         printf("Stopped at %s\n", label);
         print_stop_location(dbg, entry_addr);
         return 1;
@@ -954,6 +957,45 @@ static void print_disassembly_at_pc(cdbg_t *dbg, uintptr_t pc)
     print_memory_disassembly(dbg, pc);
 }
 
+static uint64_t get_primary_thread_id(pid_t pid)
+{
+    mach_port_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) {
+        return 0;
+    }
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t count = 0;
+    kern_return_t kr = task_threads(task, &threads, &count);
+    mach_port_deallocate(mach_task_self(), task);
+    if (kr != KERN_SUCCESS || count == 0) {
+        return 0;
+    }
+    thread_identifier_info_data_t info;
+    mach_msg_type_number_t info_count = THREAD_IDENTIFIER_INFO_COUNT;
+    uint64_t tid = 0;
+    if (thread_info(threads[0], THREAD_IDENTIFIER_INFO,
+                    (thread_info_t)&info, &info_count) == KERN_SUCCESS) {
+        tid = info.thread_id;
+    }
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                  count * sizeof(thread_act_t));
+    return tid;
+}
+
+static void print_stop_header(const cdbg_t *dbg)
+{
+    uint64_t tid = get_primary_thread_id(dbg->pid);
+    if (tid != 0) {
+        printf("[PID: %d  TID: %llu]\n",
+               (int)dbg->pid, (unsigned long long)tid);
+    } else {
+        printf("[PID: %d]\n", (int)dbg->pid);
+    }
+}
+
 static void print_stop_location(cdbg_t *dbg, uintptr_t pc)
 {
     if (cdbg_lineno_print_source_at_pc(&dbg->lineno, pc) == 0) {
@@ -1013,6 +1055,7 @@ int cdbg_step_next_line(cdbg_t *dbg)
         }
 
         if (strcmp(cur_file, start_file) != 0 || cur_line != start_line) {
+            print_stop_header(dbg);
             printf("Stopped (pc=0x%lx)\n", (unsigned long)pc);
             print_stop_location(dbg, pc);
             return 0;
@@ -1084,6 +1127,7 @@ int cdbg_next_source_line(cdbg_t *dbg)
         }
 
         if (strcmp(cur_file, start_file) != 0 || cur_line != start_line) {
+            print_stop_header(dbg);
             printf("Stopped (pc=0x%lx)\n", (unsigned long)pc);
             print_stop_location(dbg, pc);
             return 0;
@@ -1187,6 +1231,8 @@ static int report_stop(cdbg_t *dbg)
     if (cdbg_refresh_regs(dbg) != 0) {
         return -1;
     }
+
+    print_stop_header(dbg);
 
     uintptr_t pc = cdbg_regs_pc(&dbg->regs);
     if (cdbg_bp_is_trap(pc, dbg->breakpoints, dbg->breakpoint_count)) {
@@ -3009,7 +3055,6 @@ static int resolve_set_lhs(cdbg_t *dbg, char *lhs, uintptr_t *addr_out,
     bool whole_struct = false;
     if (resolve_lvalue(dbg, lhs, addr_out, size_out, signed_out, value_type,
                        sizeof(value_type), &whole_struct) != 0) {
-        fprintf(stderr, "Unknown variable: %s\n", lhs);
         return -1;
     }
     if (whole_struct) {
@@ -3150,6 +3195,41 @@ static int cmd_set(cdbg_t *dbg, char *args)
     if (lhs[0] == '&') {
         fputs("Cannot assign to an address expression\n", stderr);
         return -1;
+    }
+
+    if (lhs[0] == '$') {
+        const char *reg_name = lhs + 1;
+        if (cdbg_language_check_expr(dbg) != 0) {
+            return -1;
+        }
+        cdbg_expr_result_t reg_result = {0};
+        if (cdbg_expr_eval(dbg, rhs, &reg_result) != 0) {
+            fprintf(stderr, "Invalid expression: %s\n", rhs);
+            return -1;
+        }
+        if (reg_result.is_address) {
+            fputs("Cannot assign an address expression\n", stderr);
+            return -1;
+        }
+        if (cdbg_refresh_regs(dbg) != 0) {
+            return -1;
+        }
+        if (cdbg_regs_set_by_name(dbg->pid, &dbg->regs, reg_name,
+                                   reg_result.value, reg_result.is_float,
+                                   reg_result.fvalue) != 0) {
+            fprintf(stderr, "Unknown register: %s\n", reg_name);
+            return -1;
+        }
+        if (reg_result.is_float) {
+            printf("$%s = 0x%016llx  (%.17g)\n", reg_name,
+                   (unsigned long long)reg_result.value, reg_result.fvalue);
+        } else {
+            uint64_t readback = 0;
+            if (cdbg_regs_get_by_name(&dbg->regs, reg_name, &readback) == 0) {
+                printf("$%s = 0x%016llx\n", reg_name, (unsigned long long)readback);
+            }
+        }
+        return 0;
     }
 
     if (cdbg_language_check_expr(dbg) != 0) {
@@ -3478,6 +3558,7 @@ typedef struct {
     const char *names;
     const char *usage;
     const char *summary;
+    const char *detail;
 } cdbg_help_entry_t;
 
 static const cdbg_help_entry_t k_help_entries[] = {
@@ -3486,108 +3567,150 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "help, h",
         "help [command]",
         "List commands or show help for a specific command.",
+        NULL,
     },
     {
         "General",
         "quit, q",
         "quit",
         "Kill the debuggee (if running) and exit the debugger.",
+        NULL,
     },
     {
         "Execution",
         "run",
         "run [program [args...]]",
         "Start or restart the debuggee. Without arguments, rerun the last program.",
+        NULL,
     },
     {
         "Execution",
         "continue, c",
         "continue",
         "Resume execution until the next breakpoint or process exit.",
+        NULL,
     },
     {
         "Execution",
         "step, s",
         "step",
         "Execute one source line, entering function calls.",
+        NULL,
     },
     {
         "Execution",
         "si",
         "si",
         "Execute a single machine instruction.",
+        NULL,
     },
     {
         "Execution",
         "next, n",
         "next",
         "Execute one source line, stepping over function calls.",
+        NULL,
     },
     {
         "Execution",
         "up",
         "up",
         "Move to the caller frame and stop there.",
+        NULL,
     },
     {
         "Inspection",
         "regs, r",
         "regs",
-        "Print general-purpose and instruction pointer registers.",
+        "Print all registers: general-purpose, floating-point/NEON, and SSE/x87.",
+        "ARM64 registers:\n"
+        "  General-purpose:  x0-x28, fp (x29), lr (x30), sp, pc, cpsr\n"
+        "  NEON/FP:          v0-v31, fpsr, fpcr\n"
+        "\n"
+        "x86_64 registers:\n"
+        "  General-purpose:  rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp,\n"
+        "                    r8-r15, rip, rflags, cs, fs, gs\n"
+        "  SSE:              xmm0-xmm15, mxcsr\n"
+        "  x87 FPU:          st0-st7, fctrl, fstat, ftag\n",
     },
     {
         "Inspection",
         "print, p",
         "print [/fmt] <expr>",
         "Evaluate and print an expression. Formats: /d /x /o /t /c /s.",
+        "Format specifiers:\n"
+        "  /d   decimal (default for integers)\n"
+        "  /x   hexadecimal\n"
+        "  /o   octal\n"
+        "  /t   binary\n"
+        "  /c   character\n"
+        "  /s   C string (dereference as char*)\n"
+        "\n"
+        "Expression examples:\n"
+        "  p x              Variable\n"
+        "  p/x ptr          Pointer in hex\n"
+        "  p sa             Array\n"
+        "  p f.a, p p->b    Struct members\n"
+        "  p 3.14           Float literal\n"
+        "  p x + y * 2      Arithmetic\n"
+        "  p *ptr           Dereference\n"
+        "  p &x             Address of\n",
     },
     {
         "Inspection",
         "show",
         "show locals|args|globals|bp",
         "Print local variables, arguments, global variables, or breakpoints.",
+        NULL,
     },
     {
         "Inspection",
         "x",
         "x <addr> [count]",
         "Examine memory as a hexadecimal dump (default 16 bytes).",
+        NULL,
     },
     {
         "Inspection",
         "dis",
         "dis <func|file:line|line>",
         "Disassemble about 10 instructions at the given location.",
+        NULL,
     },
     {
         "Inspection",
         "list, l",
         "list [line|file:line|function]",
         "Show source code around the current or specified location.",
+        NULL,
     },
     {
         "Inspection",
         "lines",
         "lines [file]",
         "List line number to address mappings.",
+        NULL,
     },
     {
         "Inspection",
         "lists",
         "lists [file]",
         "List source line to address mappings.",
+        NULL,
     },
     {
         "Inspection",
         "syms, sym",
         "syms [name]",
         "List loaded symbols, optionally filtered by name.",
+        NULL,
     },
     {
         "Inspection",
         "tb",
         "tb",
         "Show a backtrace of the current call stack.",
+        NULL,
     },
     {
         "Inspection",
@@ -3595,42 +3718,64 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "leaks",
         "Run the macOS 'leaks' tool against the debuggee to report unreachable "
         "malloc blocks.",
+        NULL,
     },
     {
         "Breakpoints",
         "show",
         "show bp",
         "List breakpoints with number, enabled state, address, and location.",
+        NULL,
     },
     {
         "Breakpoints",
         "del, delete",
         "del <n> [n...] | del all",
         "Delete one or more breakpoints by number.",
+        NULL,
     },
     {
         "Breakpoints",
         "break, b",
         "break <addr|name|file:line|line>",
         "Set a breakpoint at an address, symbol, or source line.",
+        NULL,
     },
     {
         "Settings",
         "set",
-        "set <var> = <expr>",
-        "Assign a value to a variable, struct member, or array element.",
+        "set <var> = <expr>  |  set $<reg> = <expr>",
+        "Assign a value to a variable, struct member, array element, or register.",
+        "Variable examples:\n"
+        "  set x = 42\n"
+        "  set arr[0] = 1\n"
+        "  set s.field = 100\n"
+        "  set p->n = 0\n"
+        "\n"
+        "Register examples (x86_64):\n"
+        "  set $rax = 0x10              Integer GPR\n"
+        "  set $xmm0 = 3.14            SSE register (float)\n"
+        "  set $xmm0 = 0x3ff0000000000000  SSE register (bit pattern = 1.0)\n"
+        "  set $st0 = 1.5              x87 FPU register\n"
+        "\n"
+        "Register examples (ARM64):\n"
+        "  set $x0 = 0xff              Integer GPR\n"
+        "  set $v0 = 0x3ff0000000000000  NEON register (lower 64 bits)\n"
+        "  set $fpsr = 0               FP status register\n",
     },
     {
         "Settings",
         "set print",
         "set print pretty on|off",
         "Enable or disable multi-line struct and array formatting.",
+        NULL,
     },
     {
         "Settings",
         "set language",
         "set language <name>",
         "Set the expression language (c, c++, auto, fortran, ...).",
+        NULL,
     },
     {
         "Settings",
@@ -3638,6 +3783,7 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "set malloc-log on|off",
         "Enable MallocStackLogging for the debuggee so 'leaks' can show "
         "allocation backtraces. Takes effect on the next 'run'.",
+        NULL,
     },
 };
 
@@ -3675,14 +3821,34 @@ static bool help_name_matches(const cdbg_help_entry_t *entry, const char *name)
 
 static void print_help_entry(const cdbg_help_entry_t *entry)
 {
-    printf("  %s\n", entry->names);
-    printf("    %s\n", entry->usage);
-    printf("      %s\n", entry->summary);
+    printf("  %-22s  %s\n", entry->names, entry->summary);
+}
+
+static void print_help_entry_detail(const cdbg_help_entry_t *entry)
+{
+    printf("%s\n", entry->names);
+    printf("  Usage: %s\n", entry->usage);
+    printf("  %s\n", entry->summary);
+    if (entry->detail != NULL) {
+        putchar('\n');
+        /* Indent each line of the detail block by two spaces. */
+        const char *p = entry->detail;
+        while (*p != '\0') {
+            const char *nl = strchr(p, '\n');
+            size_t len = (nl != NULL) ? (size_t)(nl - p) : strlen(p);
+            if (len > 0) {
+                printf("  %.*s\n", (int)len, p);
+            } else {
+                putchar('\n');
+            }
+            p = (nl != NULL) ? nl + 1 : p + len;
+        }
+    }
 }
 
 static void print_help_all(void)
 {
-    puts("Available commands:");
+    puts("Available commands (type 'help <command>' for details):");
     puts("");
 
     const char *category = NULL;
@@ -3692,16 +3858,19 @@ static void print_help_all(void)
             printf("%s:\n", category);
         }
         print_help_entry(&k_help_entries[i]);
-        putchar('\n');
     }
 
+    puts("");
     puts("Expression examples:");
-    puts("  p x                 Print variable x");
-    puts("  p/x ptr             Print pointer value in hex");
-    puts("  p sa                Print an array");
-    puts("  p f.a, p p->b       Print struct members");
-    puts("  set x = 1           Assign to a variable");
-    puts("  set sa[1].b = 100   Assign to an array element member");
+    puts("  p x                  Print variable x");
+    puts("  p/x ptr              Print pointer in hex");
+    puts("  p sa                 Print an array");
+    puts("  p f.a, p p->b        Print struct members");
+    puts("  p 3.14               Print float literal");
+    puts("  set x = 1            Assign to a variable");
+    puts("  set sa[1].b = 100    Assign to an array element member");
+    puts("  set $rax = 0x10      Assign to an integer register");
+    puts("  set $xmm0 = 3.14     Assign float to SSE register");
 }
 
 static int cmd_help(char *args)
@@ -3719,7 +3888,7 @@ static int cmd_help(char *args)
 
     for (size_t i = 0; i < sizeof(k_help_entries) / sizeof(k_help_entries[0]); i++) {
         if (help_name_matches(&k_help_entries[i], args)) {
-            print_help_entry(&k_help_entries[i]);
+            print_help_entry_detail(&k_help_entries[i]);
             return 0;
         }
     }

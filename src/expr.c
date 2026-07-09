@@ -44,8 +44,10 @@ typedef enum {
 
 typedef struct {
     tok_type_t type;
-    uint64_t number;
-    char ident[128];
+    uint64_t   number;
+    double     fvalue;
+    bool       is_float;
+    char       ident[128];
 } token_t;
 
 typedef struct {
@@ -93,15 +95,46 @@ static token_t read_token(parser_t *p)
         return tok;
     }
 
-    if (isdigit((unsigned char)*p->cursor) ||
-        (*p->cursor == '0' && (p->cursor[1] == 'x' || p->cursor[1] == 'X'))) {
-        char *end = NULL;
-        tok.number = strtoull(p->cursor, &end, 0);
-        if (end == p->cursor) {
-            tok.type = TOK_END;
-            return tok;
+    if (isdigit((unsigned char)*p->cursor)) {
+        char *end_i = NULL;
+        unsigned long long uval = strtoull(p->cursor, &end_i, 0);
+        if (end_i > p->cursor && (*end_i == '.' || *end_i == 'e' || *end_i == 'E')) {
+            char *end_d = NULL;
+            double dval = strtod(p->cursor, &end_d);
+            uint64_t bits;
+            memcpy(&bits, &dval, sizeof(bits));
+            tok.number   = bits;
+            tok.fvalue   = dval;
+            tok.is_float = true;
+            p->cursor    = end_d;
+            if (*p->cursor == 'f' || *p->cursor == 'F' ||
+                *p->cursor == 'l' || *p->cursor == 'L') {
+                p->cursor++;
+            }
+        } else {
+            if (end_i == p->cursor) {
+                tok.type = TOK_END;
+                return tok;
+            }
+            tok.number   = uval;
+            tok.is_float = false;
+            p->cursor    = end_i;
         }
-        p->cursor = end;
+        tok.type = TOK_NUMBER;
+        return tok;
+    }
+
+    /* float literal starting with '.' (e.g. .5) */
+    if (*p->cursor == '.' && isdigit((unsigned char)p->cursor[1])) {
+        char *end_d = NULL;
+        double dval = strtod(p->cursor, &end_d);
+        uint64_t bits;
+        memcpy(&bits, &dval, sizeof(bits));
+        tok.number   = bits;
+        tok.fvalue   = dval;
+        tok.is_float = true;
+        p->cursor    = end_d;
+        if (*p->cursor == 'f' || *p->cursor == 'F') p->cursor++;
         tok.type = TOK_NUMBER;
         return tok;
     }
@@ -565,7 +598,9 @@ static int parse_multiplicative(parser_t *p, cdbg_expr_result_t *out)
 static int parse_primary(parser_t *p, cdbg_expr_result_t *out)
 {
     if (p->current.type == TOK_NUMBER) {
-        out->value = p->current.number;
+        out->value      = p->current.number;
+        out->fvalue     = p->current.fvalue;
+        out->is_float   = p->current.is_float;
         out->is_address = false;
         advance(p);
         return 0;
@@ -736,7 +771,15 @@ static int parse_unary(parser_t *p, cdbg_expr_result_t *out)
         if (parse_unary(p, &inner) != 0) {
             return -1;
         }
-        out->value = (uint64_t)(-(int64_t)inner.value);
+        if (inner.is_float) {
+            out->fvalue   = -inner.fvalue;
+            out->is_float = true;
+            uint64_t bits;
+            memcpy(&bits, &out->fvalue, sizeof(bits));
+            out->value = bits;
+        } else {
+            out->value = (uint64_t)(-(int64_t)inner.value);
+        }
         out->is_address = false;
         return 0;
     }
