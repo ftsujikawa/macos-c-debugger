@@ -3491,7 +3491,7 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "General",
         "quit, q",
         "quit",
-        "Detach from the debuggee and exit the debugger.",
+        "Kill the debuggee (if running) and exit the debugger.",
     },
     {
         "Execution",
