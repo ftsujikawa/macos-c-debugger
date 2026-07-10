@@ -3619,6 +3619,13 @@ static const cdbg_help_entry_t k_help_entries[] = {
         NULL,
     },
     {
+        "Execution",
+        "kill",
+        "kill",
+        "Kill the debuggee and return to the prompt (debugger stays open).",
+        NULL,
+    },
+    {
         "Inspection",
         "regs, r",
         "regs",
@@ -4478,6 +4485,14 @@ int cdbg_repl(cdbg_t *dbg)
                 fputs("Usage: x <addr> [count]\n", stderr);
             } else {
                 (void)cmd_examine(dbg, addr_text, count_text);
+            }
+        } else if (strcmp(cmd, "kill") == 0) {
+            if (dbg->pid <= 0 || dbg->state == CDBG_STATE_IDLE) {
+                fputs("No process is running.\n", stderr);
+            } else {
+                pid_t killed_pid = dbg->pid;
+                (void)stop_debuggee(dbg);
+                printf("Process %d killed.\n", killed_pid);
             }
         } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0) {
             (void)stop_debuggee(dbg);
