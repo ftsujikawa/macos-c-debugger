@@ -3567,63 +3567,89 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "help, h",
         "help [command]",
         "List commands or show help for a specific command.",
-        NULL,
+        "Without an argument, prints a one-line summary of every command.\n"
+        "With a command name, prints usage and full details.\n"
+        "\n"
+        "Examples:\n"
+        "  help\n"
+        "  help break\n"
+        "  help set\n",
     },
     {
         "General",
         "quit, q",
         "quit",
         "Kill the debuggee (if running) and exit the debugger.",
-        NULL,
+        "Sends SIGKILL to the debuggee, waits for it to exit, then\n"
+        "terminates the debugger session.\n"
+        "Use 'kill' to terminate only the debuggee and stay in the REPL.\n",
     },
     {
         "Execution",
         "run",
         "run [program [args...]]",
         "Start or restart the debuggee. Without arguments, rerun the last program.",
-        NULL,
+        "If a process is already running it is killed before the new one starts.\n"
+        "Breakpoints set before 'run' are preserved across restarts.\n"
+        "\n"
+        "Examples:\n"
+        "  run                     Rerun the last program\n"
+        "  run ./target            Run a specific program\n"
+        "  run ./target arg1 arg2  Run with arguments\n",
     },
     {
         "Execution",
         "continue, c",
         "continue",
         "Resume execution until the next breakpoint or process exit.",
-        NULL,
+        "Resumes the stopped debuggee and waits for the next stop event.\n"
+        "Stop events: breakpoint hit, signal received, or process exit.\n",
     },
     {
         "Execution",
         "step, s",
         "step",
         "Execute one source line, entering function calls.",
-        NULL,
+        "Steps one source line. If the line contains a function call the\n"
+        "debugger enters the callee.\n"
+        "Use 'next' to step over calls instead.\n"
+        "Use 'si' to step one machine instruction.\n",
     },
     {
         "Execution",
         "si",
         "si",
         "Execute a single machine instruction.",
-        NULL,
+        "Useful when there is no source information (e.g. inside a library)\n"
+        "or when inspecting compiler-generated code closely.\n"
+        "Use 'step' / 'next' for source-level stepping.\n",
     },
     {
         "Execution",
         "next, n",
         "next",
         "Execute one source line, stepping over function calls.",
-        NULL,
+        "Steps one source line. Function calls are executed as a unit;\n"
+        "the debugger does not enter the callee.\n"
+        "Use 'step' to step into calls instead.\n",
     },
     {
         "Execution",
         "up",
         "up",
         "Move to the caller frame and stop there.",
-        NULL,
+        "Reads the saved frame pointer and return address from the stack\n"
+        "and updates the register context to the calling frame.\n"
+        "Use 'regs' or 'print' to inspect the caller's state.\n",
     },
     {
         "Execution",
         "kill",
         "kill",
         "Kill the debuggee and return to the prompt (debugger stays open).",
-        NULL,
+        "Sends SIGKILL to the debuggee and waits for it to exit.\n"
+        "The debugger stays open; use 'run' to start a new session.\n"
+        "Use 'quit' to also exit the debugger.\n",
     },
     {
         "Inspection",
@@ -3668,56 +3694,90 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "show",
         "show locals|args|globals|bp",
         "Print local variables, arguments, global variables, or breakpoints.",
-        NULL,
+        "Subcommands:\n"
+        "  show locals    Local variables of the current function\n"
+        "  show args      Arguments of the current function\n"
+        "  show globals   Global variables in the program\n"
+        "  show bp        All breakpoints (same as 'show bp' in Breakpoints)\n",
     },
     {
         "Inspection",
         "x",
         "x <addr> [count]",
         "Examine memory as a hexadecimal dump (default 16 bytes).",
-        NULL,
+        "Dumps <count> bytes of memory at <addr> as hex + ASCII.\n"
+        "\n"
+        "Examples:\n"
+        "  x 0x100003f20        16 bytes at address\n"
+        "  x 0x100003f20 64     64 bytes at address\n"
+        "  x &buf               Address of a variable\n",
     },
     {
         "Inspection",
         "dis",
-        "dis <func|file:line|line>",
+        "dis <func|file:line|line|addr>",
         "Disassemble about 10 instructions at the given location.",
-        NULL,
+        "Location forms:\n"
+        "  dis main             Function name\n"
+        "  dis target.c:42     File and line number\n"
+        "  dis 42               Line number (single source file)\n"
+        "  dis 0x100003f20      Absolute address\n",
     },
     {
         "Inspection",
         "list, l",
         "list [line|file:line|function]",
         "Show source code around the current or specified location.",
-        NULL,
+        "Displays 10 lines centred on the target location.\n"
+        "\n"
+        "Location forms:\n"
+        "  list                 Current instruction\n"
+        "  list 42              Line 42 in the current file\n"
+        "  list target.c:42     Line 42 in a specific file\n"
+        "  list main            Start of function 'main'\n",
     },
     {
         "Inspection",
         "lines",
         "lines [file]",
         "List line number to address mappings.",
-        NULL,
+        "Prints DWARF line-number entries (address → file:line).\n"
+        "Useful for finding the address of a specific source line.\n"
+        "\n"
+        "Examples:\n"
+        "  lines              All mappings\n"
+        "  lines target.c     Only mappings for target.c\n",
     },
     {
         "Inspection",
         "lists",
         "lists [file]",
         "List source line to address mappings.",
-        NULL,
+        "Like 'lines' but grouped by source line number.\n"
+        "\n"
+        "Examples:\n"
+        "  lists              All mappings\n"
+        "  lists target.c     Only mappings for target.c\n",
     },
     {
         "Inspection",
         "syms, sym",
         "syms [name]",
         "List loaded symbols, optionally filtered by name.",
-        NULL,
+        "Prints address and name for every loaded symbol.\n"
+        "The optional argument is a substring filter.\n"
+        "\n"
+        "Examples:\n"
+        "  syms               All symbols\n"
+        "  syms main          Symbols whose name contains \"main\"\n",
     },
     {
         "Inspection",
         "tb",
         "tb",
         "Show a backtrace of the current call stack.",
-        NULL,
+        "Prints each frame as: #n  <address>  <function> (if known)\n"
+        "Unwinding follows saved FP/LR chains on the stack.\n",
     },
     {
         "Inspection",
@@ -3725,28 +3785,45 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "leaks",
         "Run the macOS 'leaks' tool against the debuggee to report unreachable "
         "malloc blocks.",
-        NULL,
+        "Runs 'leaks <pid>' and prints the output.\n"
+        "For allocation backtraces, enable malloc stack logging before running:\n"
+        "\n"
+        "  set malloc-log on\n"
+        "  run\n"
+        "  (trigger the leak)\n"
+        "  leaks\n",
     },
     {
         "Breakpoints",
-        "show",
+        "show bp",
         "show bp",
         "List breakpoints with number, enabled state, address, and location.",
-        NULL,
+        "Each line shows:\n"
+        "  #n   breakpoint number (used with 'del')\n"
+        "  [+]  enabled   [-]  disabled\n"
+        "  address\n"
+        "  source location (file:line, if known)\n",
     },
     {
         "Breakpoints",
         "del, delete",
         "del <n> [n...] | del all",
         "Delete one or more breakpoints by number.",
-        NULL,
+        "Examples:\n"
+        "  del 1          Delete breakpoint #1\n"
+        "  del 1 2 3      Delete multiple breakpoints\n"
+        "  del all        Delete all breakpoints\n",
     },
     {
         "Breakpoints",
         "break, b",
         "break <addr|name|file:line|line>",
         "Set a breakpoint at an address, symbol, or source line.",
-        NULL,
+        "Location forms:\n"
+        "  break main           Function name\n"
+        "  break target.c:42    File and line number\n"
+        "  break 42             Line number (single source file)\n"
+        "  break 0x100003f20    Absolute address\n",
     },
     {
         "Settings",
@@ -3775,14 +3852,17 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "set print",
         "set print pretty on|off",
         "Enable or disable multi-line struct and array formatting.",
-        NULL,
+        "  set print pretty on    Indent structs and arrays across multiple lines\n"
+        "  set print pretty off   Single-line output (default)\n",
     },
     {
         "Settings",
         "set language",
         "set language <name>",
         "Set the expression language (c, c++, auto, fortran, ...).",
-        NULL,
+        "Affects how expressions in 'print' and 'set' are parsed.\n"
+        "Supported: c, c++, fortran, auto\n"
+        "'auto' selects based on the current source file extension.\n",
     },
     {
         "Settings",
@@ -3790,7 +3870,11 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "set malloc-log on|off",
         "Enable MallocStackLogging for the debuggee so 'leaks' can show "
         "allocation backtraces. Takes effect on the next 'run'.",
-        NULL,
+        "Sets the MallocStackLogging environment variable for the next 'run'.\n"
+        "This lets 'leaks' report the call stack at each allocation.\n"
+        "\n"
+        "  set malloc-log on     Record allocation backtraces\n"
+        "  set malloc-log off    Disable (default)\n",
     },
 };
 
@@ -3861,6 +3945,9 @@ static void print_help_all(void)
     const char *category = NULL;
     for (size_t i = 0; i < sizeof(k_help_entries) / sizeof(k_help_entries[0]); i++) {
         if (category == NULL || strcmp(category, k_help_entries[i].category) != 0) {
+            if (category != NULL) {
+                putchar('\n');
+            }
             category = k_help_entries[i].category;
             printf("%s:\n", category);
         }
