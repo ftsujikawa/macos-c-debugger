@@ -8,6 +8,7 @@ SRCS = src/main.c \
        src/debugger.c \
        src/process.c \
        src/breakpoint.c \
+       src/watchpoint.c \
        src/memory.c \
        src/regs.c \
        src/lineno.c \

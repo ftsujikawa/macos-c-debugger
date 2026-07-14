@@ -9,8 +9,10 @@
 #include "lineno.h"
 #include "regs.h"
 #include "syms.h"
+#include "watchpoint.h"
 
 #define CDBG_MAX_BREAKPOINTS 64
+#define CDBG_MAX_WATCHPOINTS CDBG_WP_MAX_HW
 #define CDBG_MAX_CMD         256
 #define CDBG_MAX_PATH        1024
 #define CDBG_MAX_RUN_ARGS    64
@@ -43,6 +45,8 @@ typedef struct cdbg {
     cdbg_regs_t regs;
     cdbg_breakpoint_t breakpoints[CDBG_MAX_BREAKPOINTS];
     size_t breakpoint_count;
+    cdbg_watchpoint_t watchpoints[CDBG_MAX_WATCHPOINTS];
+    size_t watchpoint_count;
     cdbg_lineno_t lineno;
     cdbg_syms_t syms;
     char executable_path[CDBG_MAX_PATH];
@@ -62,6 +66,9 @@ bool          cdbg_language_supports_expr(cdbg_language_t lang);
 int           cdbg_language_check_expr(const cdbg_t *dbg);
 int           cdbg_resolve_lvalue_expr(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
                                        char *type_out, size_t type_out_len);
+int           cdbg_resolve_lvalue_expr_sized(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
+                                             size_t *size_out, char *type_out,
+                                             size_t type_out_len);
 
 int  cdbg_init(cdbg_t *dbg);
 int  cdbg_set_run_target(cdbg_t *dbg, char *const argv[]);
