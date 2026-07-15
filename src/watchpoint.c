@@ -59,6 +59,7 @@ static int primary_thread_for_pid(pid_t pid, thread_act_t *thread_out)
 #define WCR_E          (1ULL << 0)          /* Watchpoint enable          */
 #define WCR_PAC_EL0EL1 (0x3ULL << 1)        /* Trap at EL0 and EL1        */
 #define WCR_LSC_STORE  (0x2ULL << 3)        /* Trap on stores (writes)    */
+#define WCR_LSC_ANY    (0x3ULL << 3)        /* Trap on loads or stores    */
 #define WCR_BAS_SHIFT  5                    /* Byte address select        */
 
 static int get_debug_state(pid_t pid, arm_debug_state64_t *state, thread_act_t *thread_out)
@@ -82,7 +83,8 @@ static int get_debug_state(pid_t pid, arm_debug_state64_t *state, thread_act_t *
     return 0;
 }
 
-int cdbg_wp_hw_install(pid_t pid, int slot, uintptr_t addr, size_t size)
+int cdbg_wp_hw_install(pid_t pid, int slot, uintptr_t addr, size_t size,
+                        cdbg_wp_mode_t mode)
 {
     if (slot < 0 || slot >= CDBG_WP_MAX_HW) {
         return -1;
@@ -103,9 +105,10 @@ int cdbg_wp_hw_install(pid_t pid, int slot, uintptr_t addr, size_t size)
         return -1;
     }
 
+    uint64_t lsc = (mode == CDBG_WP_ACCESS) ? WCR_LSC_ANY : WCR_LSC_STORE;
     uint64_t bas = (uint64_t)(((1u << size) - 1u) << offset);
     state.__wvr[slot] = (uint64_t)(addr & ~0x7ULL);
-    state.__wcr[slot] = WCR_E | WCR_PAC_EL0EL1 | WCR_LSC_STORE | (bas << WCR_BAS_SHIFT);
+    state.__wcr[slot] = WCR_E | WCR_PAC_EL0EL1 | lsc | (bas << WCR_BAS_SHIFT);
 
     kern_return_t kr = thread_set_state(thread, ARM_DEBUG_STATE64,
                                         (thread_state_t)&state, ARM_DEBUG_STATE64_COUNT);
@@ -179,7 +182,8 @@ static uint64_t *dr_slot_ptr(x86_debug_state64_t *state, int slot)
     }
 }
 
-int cdbg_wp_hw_install(pid_t pid, int slot, uintptr_t addr, size_t size)
+int cdbg_wp_hw_install(pid_t pid, int slot, uintptr_t addr, size_t size,
+                        cdbg_wp_mode_t mode)
 {
     if (slot < 0 || slot >= CDBG_WP_MAX_HW) {
         return -1;
@@ -206,14 +210,16 @@ int cdbg_wp_hw_install(pid_t pid, int slot, uintptr_t addr, size_t size)
 
     *dr_slot_ptr(&state, slot) = (uint64_t)addr;
 
-    const uint64_t rw_write = 0x1;
+    /* DR7 RW field: 0x1 = writes only, 0x3 = reads or writes. Intel has
+     * no read-only mode (0x0 is instruction execution, not applicable). */
+    const uint64_t rw_bits = (mode == CDBG_WP_ACCESS) ? 0x3 : 0x1;
     unsigned local_enable_bit = (unsigned)(slot * 2);
     unsigned rw_shift = 16 + (unsigned)(slot * 4);
     unsigned len_shift = 18 + (unsigned)(slot * 4);
 
     state.__dr7 &= ~((uint64_t)0x3 << rw_shift);
     state.__dr7 &= ~((uint64_t)0x3 << len_shift);
-    state.__dr7 |= (rw_write << rw_shift);
+    state.__dr7 |= (rw_bits << rw_shift);
     state.__dr7 |= (len_bits << len_shift);
     state.__dr7 |= ((uint64_t)1 << local_enable_bit);
 

@@ -14,9 +14,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "ast.h"
+#include "ast_eval.h"
 #include "expr.h"
 #include "memory.h"
 #include "process.h"
+#include "repl_cmds.h"
+#include "varinfo.h"
 
 static int report_stop(cdbg_t *dbg);
 static void report_process_exit(cdbg_t *dbg);
@@ -1338,29 +1342,6 @@ static int parse_u64(const char *text, uint64_t *out)
     return 0;
 }
 
-typedef struct cdbg_struct_member {
-    char name[64];
-    char type[64];
-    size_t offset;
-    size_t size;
-    bool is_signed;
-} cdbg_struct_member_t;
-
-typedef struct cdbg_var_info {
-    char name[128];
-    char type[128];
-    char element_type[128];
-    int64_t fbreg_offset;
-    size_t size;
-    size_t element_size;
-    size_t pointee_size;
-    size_t array_count;
-    bool has_location;
-    bool is_pointer;
-    bool is_signed;
-    bool is_array;
-} cdbg_var_info_t;
-
 static char *trim_space(char *text)
 {
     while (isspace((unsigned char)*text)) {
@@ -1516,7 +1497,7 @@ static int parse_member_offset(const char *line, size_t *out)
     return 0;
 }
 
-static bool type_is_scalar(const char *type)
+bool type_is_scalar(const char *type)
 {
     if (type == NULL || type[0] == '\0') {
         return false;
@@ -1791,7 +1772,7 @@ static int dwarf_lookup_struct(cdbg_t *dbg, const char *name,
     return 0;
 }
 
-static size_t type_element_size(cdbg_t *dbg, const char *type)
+size_t type_element_size(cdbg_t *dbg, const char *type)
 {
     if (type == NULL || type[0] == '\0') {
         return 0;
@@ -2329,7 +2310,7 @@ static int collect_show_vars(cdbg_t *dbg, cdbg_show_scope_t scope, cdbg_show_var
     return *count_out > 0 ? 0 : -1;
 }
 
-static int read_scalar_value(pid_t pid, uintptr_t addr, size_t size, uint64_t *out)
+int read_scalar_value(pid_t pid, uintptr_t addr, size_t size, uint64_t *out)
 {
     if (size == 0 || size > sizeof(uint64_t)) {
         size = sizeof(uint64_t);
@@ -2357,9 +2338,9 @@ static int write_scalar_value(pid_t pid, uintptr_t addr, size_t size, uint64_t v
     return cdbg_mem_write(pid, addr, buf, size);
 }
 
-static int resolve_variable_address(cdbg_t *dbg, const char *name,
-                                    cdbg_var_info_t *var, uintptr_t *addr,
-                                    bool *found_local)
+int resolve_variable_address(cdbg_t *dbg, const char *name,
+                             cdbg_var_info_t *var, uintptr_t *addr,
+                             bool *found_local)
 {
     memset(var, 0, sizeof(*var));
     *found_local = find_local_var(dbg, name, var) == 0;
@@ -2611,22 +2592,6 @@ static void print_scalar_result(const char *label, uint64_t value, size_t size,
     }
 }
 
-static bool is_simple_identifier(const char *expr)
-{
-    if (expr == NULL || expr[0] == '\0') {
-        return false;
-    }
-    if (!isalpha((unsigned char)expr[0]) && expr[0] != '_') {
-        return false;
-    }
-    for (const char *p = expr + 1; *p != '\0'; p++) {
-        if (!isalnum((unsigned char)*p) && *p != '_') {
-            return false;
-        }
-    }
-    return true;
-}
-
 static void print_scalar_inline(uint64_t value, size_t size, bool is_signed,
                                 bool is_pointer)
 {
@@ -2679,40 +2644,7 @@ static int print_struct_element(cdbg_t *dbg, uintptr_t addr,
     return 0;
 }
 
-static bool parse_array_index_expr(const char *expr, char *name, size_t name_len,
-                                   size_t *index_out)
-{
-    const char *bracket = strchr(expr, '[');
-    if (bracket == NULL || bracket == expr) {
-        return false;
-    }
-
-    size_t nlen = (size_t)(bracket - expr);
-    if (nlen >= name_len) {
-        return false;
-    }
-    memcpy(name, expr, nlen);
-    name[nlen] = '\0';
-    if (!is_simple_identifier(name)) {
-        return false;
-    }
-
-    const char *p = bracket + 1;
-    if (*p == '\0' || !isdigit((unsigned char)*p)) {
-        return false;
-    }
-
-    char *end = NULL;
-    unsigned long idx = strtoul(p, &end, 10);
-    if (end == p || *end != ']' || end[1] != '\0') {
-        return false;
-    }
-
-    *index_out = (size_t)idx;
-    return true;
-}
-
-static void pointer_pointee_type(const cdbg_var_info_t *var, char *out, size_t out_len)
+void pointer_pointee_type(const cdbg_var_info_t *var, char *out, size_t out_len)
 {
     const char *star = strchr(var->type, '*');
     if (star == NULL) {
@@ -2729,47 +2661,6 @@ static void pointer_pointee_type(const cdbg_var_info_t *var, char *out, size_t o
     }
     memcpy(out, var->type, len);
     out[len] = '\0';
-}
-
-static int resolve_subscript_element(cdbg_t *dbg, const char *var_name, size_t index,
-                                     cdbg_var_info_t *elem_view, uintptr_t *elem_addr)
-{
-    cdbg_var_info_t var = {0};
-    uintptr_t addr = 0;
-    bool found_local = false;
-    if (resolve_variable_address(dbg, var_name, &var, &addr, &found_local) != 0) {
-        fprintf(stderr, "Unknown variable: %s\n", var_name);
-        return -1;
-    }
-
-    if (var.is_array) {
-        if (index >= var.array_count) {
-            fprintf(stderr, "Array index out of bounds: %zu\n", index);
-            return -1;
-        }
-        *elem_view = var;
-        *elem_addr = addr + index * var.element_size;
-        return 0;
-    }
-
-    if (var.is_pointer) {
-        uint64_t ptr = 0;
-        if (read_scalar_value(dbg->pid, addr, sizeof(uintptr_t), &ptr) != 0) {
-            return -1;
-        }
-
-        char pointee_type[128];
-        pointer_pointee_type(&var, pointee_type, sizeof(pointee_type));
-        memset(elem_view, 0, sizeof(*elem_view));
-        snprintf(elem_view->element_type, sizeof(elem_view->element_type), "%s",
-                 pointee_type);
-        elem_view->element_size = type_element_size(dbg, pointee_type);
-        *elem_addr = (uintptr_t)ptr + index * elem_view->element_size;
-        return 0;
-    }
-
-    fprintf(stderr, "%s is not an array or pointer\n", var_name);
-    return -1;
 }
 
 static int print_array_element_value(cdbg_t *dbg, const cdbg_var_info_t *var,
@@ -2876,17 +2767,10 @@ static int print_named_variable(cdbg_t *dbg, const cdbg_var_info_t *var, uintptr
     return 0;
 }
 
-static int lookup_struct_member(cdbg_t *dbg, const char *struct_type,
-                                const char *member_name, size_t *offset_out,
-                                size_t *size_out, bool *signed_out,
-                                char *type_out, size_t type_out_len);
-
-static int split_access_path(char *expr, char **base_out, char **member_out,
-                             bool *via_pointer);
-
-static int resolve_lvalue(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
-                          size_t *size_out, bool *signed_out, char *value_type,
-                          size_t value_type_len, bool *whole_struct_out);
+int lookup_struct_member(cdbg_t *dbg, const char *struct_type,
+                         const char *member_name, size_t *offset_out,
+                         size_t *size_out, bool *signed_out,
+                         char *type_out, size_t type_out_len);
 
 static int cmd_print(cdbg_t *dbg, char *expr)
 {
@@ -2915,81 +2799,59 @@ static int cmd_print(cdbg_t *dbg, char *expr)
         return -1;
     }
 
-    if (is_simple_identifier(expr)) {
-        cdbg_var_info_t var = {0};
-        uintptr_t addr = 0;
-        bool found_local = false;
-        if (resolve_variable_address(dbg, expr, &var, &addr, &found_local) == 0) {
-            if (var.is_array && fmt == PRINT_FMT_DEFAULT) {
-                return print_array_variable(dbg, expr, &var, addr);
-            }
-
-            if (!var.is_pointer && fmt == PRINT_FMT_DEFAULT &&
-                !type_is_scalar(var.type)) {
-                cdbg_struct_member_t members[32];
-                size_t member_count = 0;
-                size_t struct_size = 0;
-                if (dwarf_lookup_struct(dbg, var.type, members, 32, &member_count,
-                                        &struct_size) == 0) {
-                    printf("%s = ", expr);
-                    print_type_annotation(dbg, fmt, var.type);
-                    if (print_struct_element(dbg, addr, members, member_count,
-                                             dbg->print_pretty) != 0) {
-                        return -1;
-                    }
-                    putchar('\n');
-                    return 0;
-                }
-            }
-
-            uint64_t value = 0;
-            if (read_scalar_value(dbg->pid, addr, var.size, &value) != 0) {
-                return -1;
-            }
-            print_scalar_result_fmt(dbg, expr, fmt, value, var.size, var.is_signed,
-                                    var.is_pointer, false, var.type);
-            return 0;
-        }
+    cdbg_ast_t *ast = cdbg_ast_parse(expr);
+    if (ast == NULL) {
+        return -1;
     }
 
-    char work_expr[256];
-    snprintf(work_expr, sizeof(work_expr), "%s", expr);
     uintptr_t addr = 0;
-    size_t size = 0;
-    bool is_signed = false;
-    char value_type[128];
-    bool whole_struct = false;
-    if (resolve_lvalue(dbg, work_expr, &addr, &size, &is_signed, value_type,
-                       sizeof(value_type), &whole_struct) == 0) {
-        if (whole_struct && fmt == PRINT_FMT_DEFAULT) {
+    cdbg_var_info_t var = {0};
+    if (cdbg_ast_is_lvalue_shaped(ast)) {
+        if (cdbg_ast_resolve_lvalue(dbg, ast, &addr, &var) != 0) {
+            /* Error already reported by cdbg_ast_resolve_lvalue. An
+             * lvalue-shaped node (variable/member/index/deref) that
+             * fails to resolve as an lvalue can't succeed as arithmetic
+             * either (cdbg_ast_eval delegates the same node kinds back
+             * to cdbg_ast_resolve_lvalue), so don't fall through. */
+            cdbg_ast_free(ast);
+            return -1;
+        }
+        cdbg_ast_free(ast);
+
+        if (var.is_array && fmt == PRINT_FMT_DEFAULT) {
+            return print_array_variable(dbg, expr, &var, addr);
+        }
+
+        if (!var.is_pointer && fmt == PRINT_FMT_DEFAULT && !type_is_scalar(var.type)) {
             cdbg_struct_member_t members[32];
             size_t member_count = 0;
             size_t struct_size = 0;
-            if (dwarf_lookup_struct(dbg, value_type, members, 32, &member_count,
-                                    &struct_size) != 0) {
-                return -1;
+            if (dwarf_lookup_struct(dbg, var.type, members, 32, &member_count,
+                                    &struct_size) == 0) {
+                printf("%s = ", expr);
+                print_type_annotation(dbg, fmt, var.type);
+                if (print_struct_element(dbg, addr, members, member_count,
+                                         dbg->print_pretty) != 0) {
+                    return -1;
+                }
+                putchar('\n');
+                return 0;
             }
-            printf("%s = ", expr);
-            print_type_annotation(dbg, fmt, value_type);
-            if (print_struct_element(dbg, addr, members, member_count,
-                                     dbg->print_pretty) != 0) {
-                return -1;
-            }
-            putchar('\n');
-            return 0;
         }
 
         uint64_t value = 0;
-        if (read_scalar_value(dbg->pid, addr, size, &value) != 0) {
+        if (read_scalar_value(dbg->pid, addr, var.size, &value) != 0) {
             return -1;
         }
-        print_scalar_result_fmt(dbg, expr, fmt, value, size, is_signed, false, false,
-                                value_type);
+        print_scalar_result_fmt(dbg, expr, fmt, value, var.size, var.is_signed,
+                                var.is_pointer, false, var.type);
         return 0;
     }
 
     cdbg_expr_result_t result = {0};
-    if (cdbg_expr_eval(dbg, expr, &result) != 0) {
+    int rc = cdbg_ast_eval(dbg, ast, &result);
+    cdbg_ast_free(ast);
+    if (rc != 0) {
         return -1;
     }
 
@@ -2999,10 +2861,10 @@ static int cmd_print(cdbg_t *dbg, char *expr)
     return 0;
 }
 
-static int lookup_struct_member(cdbg_t *dbg, const char *struct_type,
-                                const char *member_name, size_t *offset_out,
-                                size_t *size_out, bool *signed_out,
-                                char *type_out, size_t type_out_len)
+int lookup_struct_member(cdbg_t *dbg, const char *struct_type,
+                         const char *member_name, size_t *offset_out,
+                         size_t *size_out, bool *signed_out,
+                         char *type_out, size_t type_out_len)
 {
     cdbg_struct_member_t members[32];
     size_t member_count = 0;
@@ -3026,206 +2888,34 @@ static int lookup_struct_member(cdbg_t *dbg, const char *struct_type,
     return -1;
 }
 
-static int split_access_path(char *expr, char **base_out, char **member_out,
-                             bool *via_pointer)
-{
-    char *arrow = strstr(expr, "->");
-    if (arrow != NULL) {
-        *arrow = '\0';
-        *base_out = trim_space(expr);
-        *member_out = trim_space(arrow + 2);
-        *via_pointer = true;
-        if ((*member_out)[0] == '\0' || !is_simple_identifier(*member_out)) {
-            return -1;
-        }
-        return 0;
-    }
-
-    char *dot = strchr(expr, '.');
-    if (dot != NULL) {
-        *dot = '\0';
-        *base_out = trim_space(expr);
-        *member_out = trim_space(dot + 1);
-        *via_pointer = false;
-        if ((*member_out)[0] == '\0' || !is_simple_identifier(*member_out)) {
-            return -1;
-        }
-        return 0;
-    }
-
-    *base_out = trim_space(expr);
-    *member_out = NULL;
-    *via_pointer = false;
-    return 0;
-}
-
-static int resolve_lvalue(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
-                          size_t *size_out, bool *signed_out, char *value_type,
-                          size_t value_type_len, bool *whole_struct_out)
-{
-    *whole_struct_out = false;
-
-    char *base = NULL;
-    char *member = NULL;
-    bool via_ptr = false;
-    if (split_access_path(expr, &base, &member, &via_ptr) != 0) {
-        return -1;
-    }
-
-    char type_buf[128] = {0};
-    uintptr_t addr = 0;
-    size_t value_size = 0;
-    bool value_signed = false;
-
-    if (base[0] == '*') {
-        const char *inner = trim_space(base + 1);
-        if (inner[0] == '\0') {
-            return -1;
-        }
-
-        uint64_t parsed = 0;
-        if (parse_u64(inner, &parsed) == 0) {
-            addr = (uintptr_t)parsed;
-            value_size = sizeof(uint64_t);
-        } else {
-            cdbg_var_info_t var = {0};
-            uintptr_t var_addr = 0;
-            bool found = false;
-            if (resolve_variable_address(dbg, inner, &var, &var_addr, &found) != 0) {
-                fprintf(stderr, "Unknown variable: %s\n", inner);
-                return -1;
-            }
-            if (!var.is_pointer) {
-                fprintf(stderr, "%s is not a pointer\n", inner);
-                return -1;
-            }
-            uint64_t ptr = 0;
-            if (read_scalar_value(dbg->pid, var_addr, sizeof(uintptr_t), &ptr) != 0) {
-                return -1;
-            }
-            addr = (uintptr_t)ptr;
-            pointer_pointee_type(&var, type_buf, sizeof(type_buf));
-            value_size = type_element_size(dbg, type_buf);
-        }
-    } else {
-        char arr_name[128];
-        size_t arr_index = 0;
-        if (parse_array_index_expr(base, arr_name, sizeof(arr_name), &arr_index)) {
-            cdbg_var_info_t elem_var = {0};
-            if (resolve_subscript_element(dbg, arr_name, arr_index, &elem_var, &addr) != 0) {
-                return -1;
-            }
-            snprintf(type_buf, sizeof(type_buf), "%s", elem_var.element_type);
-            value_size = elem_var.element_size;
-        } else if (is_simple_identifier(base)) {
-            cdbg_var_info_t var = {0};
-            uintptr_t var_addr = 0;
-            bool found = false;
-            if (resolve_variable_address(dbg, base, &var, &var_addr, &found) != 0) {
-                fprintf(stderr, "Unknown variable: %s\n", base);
-                return -1;
-            }
-            if (var.is_array && member == NULL) {
-                return -1;
-            }
-            if (via_ptr) {
-                if (!var.is_pointer) {
-                    fprintf(stderr, "%s is not a pointer\n", base);
-                    return -1;
-                }
-                uint64_t ptr = 0;
-                if (read_scalar_value(dbg->pid, var_addr, sizeof(uintptr_t), &ptr) != 0) {
-                    return -1;
-                }
-                addr = (uintptr_t)ptr;
-                pointer_pointee_type(&var, type_buf, sizeof(type_buf));
-                value_size = type_element_size(dbg, type_buf);
-            } else {
-                addr = var_addr;
-                snprintf(type_buf, sizeof(type_buf), "%s", var.type);
-                value_size = var.size;
-                value_signed = var.is_signed;
-            }
-        } else {
-            return -1;
-        }
-    }
-
-    if (member != NULL) {
-        size_t offset = 0;
-        size_t member_size = 0;
-        bool member_signed = false;
-        char member_type[64] = {0};
-        if (lookup_struct_member(dbg, type_buf, member, &offset, &member_size,
-                                 &member_signed, member_type, sizeof(member_type)) != 0) {
-            fprintf(stderr, "Unknown member: %s\n", member);
-            return -1;
-        }
-        *addr_out = addr + offset;
-        *size_out = member_size;
-        *signed_out = member_signed;
-        snprintf(value_type, value_type_len, "%s",
-                 member_type[0] != '\0' ? member_type : type_buf);
-        return 0;
-    }
-
-    *addr_out = addr;
-    *size_out = value_size;
-    if (type_buf[0] != '\0') {
-        value_signed = strstr(type_buf, "unsigned") == NULL;
-    }
-    *signed_out = value_signed;
-    snprintf(value_type, value_type_len, "%s", type_buf);
-    if (type_buf[0] != '\0' && !type_is_scalar(type_buf)) {
-        *whole_struct_out = true;
-    }
-    return 0;
-}
-
-int cdbg_resolve_lvalue_expr(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
-                             char *type_out, size_t type_out_len)
-{
-    if (dbg == NULL || expr == NULL || addr_out == NULL) {
-        return -1;
-    }
-
-    size_t size = 0;
-    bool is_signed = false;
-    bool whole_struct = false;
-    char type_buf[128] = {0};
-    if (resolve_lvalue(dbg, expr, addr_out, &size, &is_signed, type_buf, sizeof(type_buf),
-                       &whole_struct) != 0) {
-        return -1;
-    }
-
-    if (type_out != NULL && type_out_len > 0) {
-        snprintf(type_out, type_out_len, "%s", type_buf);
-    }
-    (void)is_signed;
-    (void)whole_struct;
-    return 0;
-}
-
-int cdbg_resolve_lvalue_expr_sized(cdbg_t *dbg, char *expr, uintptr_t *addr_out,
+int cdbg_resolve_lvalue_expr_sized(cdbg_t *dbg, const char *expr, uintptr_t *addr_out,
                                    size_t *size_out, char *type_out, size_t type_out_len)
 {
     if (dbg == NULL || expr == NULL || addr_out == NULL || size_out == NULL) {
         return -1;
     }
 
-    bool is_signed = false;
-    bool whole_struct = false;
-    char type_buf[128] = {0};
-    if (resolve_lvalue(dbg, expr, addr_out, size_out, &is_signed, type_buf, sizeof(type_buf),
-                       &whole_struct) != 0) {
+    cdbg_ast_t *ast = cdbg_ast_parse(expr);
+    if (ast == NULL) {
+        return -1;
+    }
+    if (!cdbg_ast_is_lvalue_shaped(ast)) {
+        fprintf(stderr, "Not an lvalue: %s\n", expr);
+        cdbg_ast_free(ast);
         return -1;
     }
 
-    if (type_out != NULL && type_out_len > 0) {
-        snprintf(type_out, type_out_len, "%s", type_buf);
+    cdbg_var_info_t var = {0};
+    if (cdbg_ast_resolve_lvalue(dbg, ast, addr_out, &var) != 0) {
+        cdbg_ast_free(ast);
+        return -1;
     }
-    (void)is_signed;
-    (void)whole_struct;
+    cdbg_ast_free(ast);
+
+    *size_out = var.size;
+    if (type_out != NULL && type_out_len > 0) {
+        snprintf(type_out, type_out_len, "%s", var.type);
+    }
     return 0;
 }
 
@@ -3236,21 +2926,34 @@ static int resolve_set_lhs(cdbg_t *dbg, char *lhs, uintptr_t *addr_out,
         return -1;
     }
 
-    if (lhs[0] == '&') {
+    cdbg_ast_t *ast = cdbg_ast_parse(lhs);
+    if (ast == NULL) {
+        return -1;
+    }
+    if (ast->kind == CDBG_AST_ADDR) {
         fputs("Cannot assign to an address expression\n", stderr);
+        cdbg_ast_free(ast);
+        return -1;
+    }
+    if (!cdbg_ast_is_lvalue_shaped(ast)) {
+        fprintf(stderr, "Not an lvalue: %s\n", lhs);
+        cdbg_ast_free(ast);
         return -1;
     }
 
-    char value_type[128];
-    bool whole_struct = false;
-    if (resolve_lvalue(dbg, lhs, addr_out, size_out, signed_out, value_type,
-                       sizeof(value_type), &whole_struct) != 0) {
+    cdbg_var_info_t var = {0};
+    if (cdbg_ast_resolve_lvalue(dbg, ast, addr_out, &var) != 0) {
+        cdbg_ast_free(ast);
         return -1;
     }
-    if (whole_struct) {
+    cdbg_ast_free(ast);
+
+    if (var.type[0] != '\0' && !type_is_scalar(var.type)) {
         fputs("Cannot assign to a struct value\n", stderr);
         return -1;
     }
+    *size_out = var.size;
+    *signed_out = var.is_signed;
     return 0;
 }
 
@@ -3353,7 +3056,7 @@ static int cmd_set_malloc_log(cdbg_t *dbg, char *args)
     return -1;
 }
 
-static int cmd_set(cdbg_t *dbg, char *args)
+int cmd_set(cdbg_t *dbg, char *args)
 {
     if (args == NULL) {
         fputs("Usage: set <var> <expr> | set print pretty on|off | "
@@ -3541,7 +3244,7 @@ static int frame_record_next(cdbg_t *dbg, uintptr_t fp,
     return 0;
 }
 
-static int cmd_backtrace(cdbg_t *dbg)
+int cmd_backtrace(cdbg_t *dbg)
 {
     if (cdbg_refresh_regs(dbg) != 0) {
         return -1;
@@ -3567,7 +3270,7 @@ static int cmd_backtrace(cdbg_t *dbg)
     return 0;
 }
 
-static int cmd_run(cdbg_t *dbg, char *args)
+int cmd_run(cdbg_t *dbg, char *args)
 {
     if (args != NULL) {
         args = trim_space(args);
@@ -3670,7 +3373,7 @@ static int cmd_show_watchpoints(const cdbg_t *dbg)
     return 0;
 }
 
-static int cmd_show(cdbg_t *dbg, char *args)
+int cmd_show(cdbg_t *dbg, char *args)
 {
     if (args == NULL) {
         fputs("Usage: show locals|args|globals|bp|watch\n", stderr);
@@ -3728,7 +3431,7 @@ static int cmd_show(cdbg_t *dbg, char *args)
     return 0;
 }
 
-static int cmd_leaks(cdbg_t *dbg)
+int cmd_leaks(cdbg_t *dbg)
 {
     if (dbg->pid <= 0 || dbg->state == CDBG_STATE_IDLE) {
         fputs("No process is running\n", stderr);
@@ -4050,11 +3753,16 @@ static const cdbg_help_entry_t k_help_entries[] = {
     {
         "Watchpoints",
         "watch",
-        "watch <expr>",
+        "watch [/r] [/1|/2|/4|/8] <expr>",
         "Stop when the value at <expr> changes (hardware watchpoint on write).",
         "Uses CPU debug registers (DBGWVR/DBGWCR on arm64, DR0-DR3 on x86_64) "
         "to trap writes without single-stepping, so execution runs at full "
         "speed until the watched memory actually changes.\n"
+        "\n"
+        "Flags (must come before <expr>, in any order):\n"
+        "  /r        Also trap on reads, not just writes\n"
+        "  /1,/2,/4,/8  Force the watch size in bytes instead of inferring "
+        "it from <expr>'s type\n"
         "\n"
         "Requires a running or stopped process (the expression is resolved "
         "against the current frame, like 'print').\n"
@@ -4066,6 +3774,8 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "  watch counter        Stop when global/local 'counter' changes\n"
         "  watch arr[0]         Stop when the first array element changes\n"
         "  watch s.field        Stop when a struct member changes\n"
+        "  watch /r counter     Stop on reads or writes to 'counter'\n"
+        "  watch /1 flags       Watch only the first byte of 'flags'\n"
         "  watch                List current watchpoints (same as 'show watch')\n",
     },
     {
@@ -4220,7 +3930,7 @@ static void print_help_all(void)
     puts("  set $xmm0 = 3.14     Assign float to SSE register");
 }
 
-static int cmd_help(char *args)
+int cmd_help(char *args)
 {
     if (args == NULL) {
         print_help_all();
@@ -4245,7 +3955,7 @@ static int cmd_help(char *args)
     return -1;
 }
 
-static int cmd_examine(cdbg_t *dbg, const char *addr_text, const char *count_text)
+int cmd_examine(cdbg_t *dbg, const char *addr_text, const char *count_text)
 {
     uint64_t addr = 0;
     uint64_t count = 16;
@@ -4373,7 +4083,7 @@ static int resolve_dis_target(cdbg_t *dbg, const char *target, uintptr_t *addr_o
     return 0;
 }
 
-static int cmd_dis(cdbg_t *dbg, const char *target)
+int cmd_dis(cdbg_t *dbg, const char *target)
 {
     if (target == NULL) {
         fputs("Usage: dis <function|file:line|line>\n", stderr);
@@ -4403,13 +4113,13 @@ static int cmd_dis(cdbg_t *dbg, const char *target)
     return 0;
 }
 
-static int cmd_lines(cdbg_t *dbg, const char *file_filter)
+int cmd_lines(cdbg_t *dbg, const char *file_filter)
 {
     cdbg_lineno_print_list(&dbg->lineno, file_filter);
     return 0;
 }
 
-static int cmd_list(cdbg_t *dbg, char *target)
+int cmd_list(cdbg_t *dbg, char *target)
 {
     if (target == NULL || trim_space(target)[0] == '\0') {
         if (cdbg_refresh_regs(dbg) != 0) {
@@ -4495,7 +4205,7 @@ static int delete_breakpoint_at(cdbg_t *dbg, size_t index)
     return 0;
 }
 
-static int cmd_del(cdbg_t *dbg, char *args)
+int cmd_del(cdbg_t *dbg, char *args)
 {
     if (dbg->breakpoint_count == 0) {
         puts("No breakpoints.");
@@ -4572,7 +4282,7 @@ static int cmd_del(cdbg_t *dbg, char *args)
     return 0;
 }
 
-static int cmd_break(cdbg_t *dbg, const char *target)
+int cmd_break(cdbg_t *dbg, const char *target)
 {
     uintptr_t addr = 0;
     char label_buf[CDBG_LINENO_MAX_FILE + 32];
@@ -4673,7 +4383,8 @@ static int delete_watchpoint_at(cdbg_t *dbg, size_t index)
     for (size_t i = index + 1; i < dbg->watchpoint_count; i++) {
         dbg->watchpoints[i - 1] = dbg->watchpoints[i];
         if (live && cdbg_wp_hw_install(dbg->pid, (int)(i - 1), dbg->watchpoints[i - 1].addr,
-                                       dbg->watchpoints[i - 1].size) != 0) {
+                                       dbg->watchpoints[i - 1].size,
+                                       dbg->watchpoints[i - 1].mode) != 0) {
             return -1;
         }
     }
@@ -4682,7 +4393,7 @@ static int delete_watchpoint_at(cdbg_t *dbg, size_t index)
     return 0;
 }
 
-static int cmd_unwatch(cdbg_t *dbg, char *args)
+int cmd_unwatch(cdbg_t *dbg, char *args)
 {
     if (dbg->watchpoint_count == 0) {
         puts("No watchpoints.");
@@ -4759,7 +4470,51 @@ static int cmd_unwatch(cdbg_t *dbg, char *args)
     return 0;
 }
 
-static int cmd_watch(cdbg_t *dbg, char *expr)
+/* Parses and strips leading `/r` and `/1|/2|/4|/8` flags from `*expr`,
+ * advancing `*expr` past them to the start of the expression text.
+ * Returns 0 on success, -1 on an unrecognized flag (usage already printed). */
+static int parse_watch_flags(char **expr, bool *watch_read, size_t *explicit_size)
+{
+    char *p = *expr;
+    while (p[0] == '/') {
+        p++;
+        char *flag_start = p;
+        while (p[0] != '\0' && !isspace((unsigned char)p[0])) {
+            p++;
+        }
+        size_t flag_len = (size_t)(p - flag_start);
+
+        char flag[16];
+        if (flag_len == 0 || flag_len >= sizeof(flag)) {
+            fputs("Usage: watch [/r] [/1|/2|/4|/8] <expr>\n", stderr);
+            return -1;
+        }
+        memcpy(flag, flag_start, flag_len);
+        flag[flag_len] = '\0';
+
+        if (strcmp(flag, "r") == 0) {
+            *watch_read = true;
+        } else if (strcmp(flag, "1") == 0) {
+            *explicit_size = 1;
+        } else if (strcmp(flag, "2") == 0) {
+            *explicit_size = 2;
+        } else if (strcmp(flag, "4") == 0) {
+            *explicit_size = 4;
+        } else if (strcmp(flag, "8") == 0) {
+            *explicit_size = 8;
+        } else {
+            fprintf(stderr, "Unknown watch flag: /%s\n", flag);
+            fputs("Usage: watch [/r] [/1|/2|/4|/8] <expr>\n", stderr);
+            return -1;
+        }
+
+        p = trim_space(p);
+    }
+    *expr = p;
+    return 0;
+}
+
+int cmd_watch(cdbg_t *dbg, char *expr)
 {
     if (dbg->state == CDBG_STATE_IDLE) {
         fputs("No process is running\n", stderr);
@@ -4771,6 +4526,16 @@ static int cmd_watch(cdbg_t *dbg, char *expr)
     }
     if (expr == NULL || expr[0] == '\0') {
         return cmd_show_watchpoints(dbg);
+    }
+
+    bool watch_read = false;
+    size_t explicit_size = 0;
+    if (parse_watch_flags(&expr, &watch_read, &explicit_size) != 0) {
+        return -1;
+    }
+    if (expr[0] == '\0') {
+        fputs("Usage: watch [/r] [/1|/2|/4|/8] <expr>\n", stderr);
+        return -1;
     }
 
     if (dbg->watchpoint_count >= CDBG_WP_MAX_HW) {
@@ -4797,15 +4562,24 @@ static int cmd_watch(cdbg_t *dbg, char *expr)
         return -1;
     }
 
-    size_t hw_size = watch_hw_size_for(value_size);
+    cdbg_wp_mode_t mode = watch_read ? CDBG_WP_ACCESS : CDBG_WP_WRITE;
     size_t slot = dbg->watchpoint_count;
     int installed = -1;
-    while (hw_size >= 1) {
-        if (cdbg_wp_hw_install(dbg->pid, (int)slot, addr, hw_size) == 0) {
+    size_t hw_size;
+    if (explicit_size != 0) {
+        hw_size = explicit_size;
+        if (cdbg_wp_hw_install(dbg->pid, (int)slot, addr, hw_size, mode) == 0) {
             installed = 0;
-            break;
         }
-        hw_size /= 2;
+    } else {
+        hw_size = watch_hw_size_for(value_size);
+        while (hw_size >= 1) {
+            if (cdbg_wp_hw_install(dbg->pid, (int)slot, addr, hw_size, mode) == 0) {
+                installed = 0;
+                break;
+            }
+            hw_size /= 2;
+        }
     }
     if (installed != 0) {
         fprintf(stderr, "Cannot set hardware watchpoint on %s (0x%lx)\n",
@@ -4823,6 +4597,7 @@ static int cmd_watch(cdbg_t *dbg, char *expr)
     wp->enabled = true;
     wp->addr = addr;
     wp->size = hw_size;
+    wp->mode = mode;
     snprintf(wp->expr, sizeof(wp->expr), "%s", expr);
     snprintf(wp->type, sizeof(wp->type), "%s", type_buf);
 
@@ -4832,12 +4607,13 @@ static int cmd_watch(cdbg_t *dbg, char *expr)
     }
 
     dbg->watchpoint_count++;
-    printf("Watchpoint %zu: %s (0x%lx, %zu bytes)\n", slot, expr,
-           (unsigned long)addr, hw_size);
+    printf("Watchpoint %zu: %s (0x%lx, %zu bytes%s)\n", slot, expr,
+           (unsigned long)addr, hw_size,
+           mode == CDBG_WP_ACCESS ? ", read/write" : "");
     return 0;
 }
 
-static void cmd_print_from_repl(cdbg_t *dbg, const char *cmd, char *rest)
+void cmd_print_from_repl(cdbg_t *dbg, const char *cmd, char *rest)
 {
     char expr[CDBG_MAX_CMD];
     const char *fmt = NULL;
@@ -4861,6 +4637,117 @@ static void cmd_print_from_repl(cdbg_t *dbg, const char *cmd, char *rest)
     }
 
     (void)cmd_print(dbg, expr);
+}
+
+cdbg_repl_outcome_t cdbg_repl_cmd_continue(cdbg_t *dbg)
+{
+    if (dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running\n", stderr);
+        return CDBG_REPL_OK;
+    }
+    if (cdbg_continue(dbg) != 0) {
+        return CDBG_REPL_FATAL;
+    }
+    if (dbg->state == CDBG_STATE_IDLE) {
+        report_process_exit(dbg);
+        return CDBG_REPL_OK;
+    }
+    if (cdbg_wait(dbg) != 0) {
+        if (dbg->state == CDBG_STATE_IDLE) {
+            report_process_exit(dbg);
+            return CDBG_REPL_OK;
+        }
+        return CDBG_REPL_FATAL;
+    }
+    if (dbg->state == CDBG_STATE_STOPPED) {
+        (void)report_stop(dbg);
+    } else if (dbg->state == CDBG_STATE_IDLE) {
+        report_process_exit(dbg);
+    }
+    return CDBG_REPL_OK;
+}
+
+cdbg_repl_outcome_t cdbg_repl_cmd_step(cdbg_t *dbg)
+{
+    if (dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running\n", stderr);
+        return CDBG_REPL_OK;
+    }
+    if (cdbg_step_next_line(dbg) != 0 && dbg->state != CDBG_STATE_IDLE) {
+        return CDBG_REPL_FATAL;
+    }
+    if (dbg->state == CDBG_STATE_IDLE) {
+        report_process_exit(dbg);
+    }
+    return CDBG_REPL_OK;
+}
+
+cdbg_repl_outcome_t cdbg_repl_cmd_si(cdbg_t *dbg)
+{
+    if (dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running\n", stderr);
+        return CDBG_REPL_OK;
+    }
+    if (cdbg_single_step(dbg) != 0) {
+        return CDBG_REPL_FATAL;
+    }
+    if (cdbg_wait(dbg) != 0) {
+        if (dbg->state == CDBG_STATE_IDLE) {
+            report_process_exit(dbg);
+            return CDBG_REPL_OK;
+        }
+        return CDBG_REPL_FATAL;
+    }
+    if (dbg->state == CDBG_STATE_STOPPED) {
+        (void)report_stop(dbg);
+    } else if (dbg->state == CDBG_STATE_IDLE) {
+        report_process_exit(dbg);
+    }
+    return CDBG_REPL_OK;
+}
+
+cdbg_repl_outcome_t cdbg_repl_cmd_next(cdbg_t *dbg)
+{
+    if (dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running\n", stderr);
+        return CDBG_REPL_OK;
+    }
+    if (cdbg_next_source_line(dbg) != 0 && dbg->state != CDBG_STATE_IDLE) {
+        return CDBG_REPL_FATAL;
+    }
+    if (dbg->state == CDBG_STATE_IDLE) {
+        report_process_exit(dbg);
+    }
+    return CDBG_REPL_OK;
+}
+
+cdbg_repl_outcome_t cdbg_repl_cmd_regs(cdbg_t *dbg)
+{
+    if (cdbg_refresh_regs(dbg) != 0) {
+        return CDBG_REPL_FATAL;
+    }
+    cdbg_print_regs(dbg);
+    return CDBG_REPL_OK;
+}
+
+cdbg_repl_outcome_t cdbg_repl_cmd_kill(cdbg_t *dbg)
+{
+    if (dbg->pid <= 0 || dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running.\n", stderr);
+    } else {
+        pid_t killed_pid = dbg->pid;
+        (void)stop_debuggee(dbg);
+        printf("Process %d killed.\n", killed_pid);
+    }
+    return CDBG_REPL_OK;
+}
+
+cdbg_repl_outcome_t cdbg_repl_cmd_quit(cdbg_t *dbg)
+{
+    (void)stop_debuggee(dbg);
+    cdbg_lineno_free(&dbg->lineno);
+    cdbg_syms_free(&dbg->syms);
+    return CDBG_REPL_QUIT;
 }
 
 int cdbg_repl(cdbg_t *dbg)
@@ -4888,158 +4775,17 @@ int cdbg_repl(cdbg_t *dbg)
             *newline = '\0';
         }
 
-        char *cmd = strtok(line, " \t");
-        if (cmd == NULL || cmd[0] == '\0') {
+        char *trimmed = trim_space(line);
+        if (trimmed[0] == '\0') {
             continue;
         }
 
-        if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_help(args);
-        } else if (strcmp(cmd, "run") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_run(dbg, args);
-        } else if (strcmp(cmd, "continue") == 0 || strcmp(cmd, "c") == 0) {
-            if (dbg->state == CDBG_STATE_IDLE) {
-                fputs("No process is running\n", stderr);
-                continue;
-            }
-            if (cdbg_continue(dbg) != 0) {
-                return -1;
-            }
-            if (dbg->state == CDBG_STATE_IDLE) {
-                report_process_exit(dbg);
-                continue;
-            }
-            if (cdbg_wait(dbg) != 0) {
-                if (dbg->state == CDBG_STATE_IDLE) {
-                    report_process_exit(dbg);
-                    continue;
-                }
-                return -1;
-            }
-            if (dbg->state == CDBG_STATE_STOPPED) {
-                (void)report_stop(dbg);
-            } else if (dbg->state == CDBG_STATE_IDLE) {
-                report_process_exit(dbg);
-            }
-        } else if (strcmp(cmd, "step") == 0 || strcmp(cmd, "s") == 0) {
-            if (dbg->state == CDBG_STATE_IDLE) {
-                fputs("No process is running\n", stderr);
-                continue;
-            }
-            if (cdbg_step_next_line(dbg) != 0 && dbg->state != CDBG_STATE_IDLE) {
-                return -1;
-            }
-            if (dbg->state == CDBG_STATE_IDLE) {
-                report_process_exit(dbg);
-            }
-        } else if (strcmp(cmd, "si") == 0) {
-            if (dbg->state == CDBG_STATE_IDLE) {
-                fputs("No process is running\n", stderr);
-                continue;
-            }
-            if (cdbg_single_step(dbg) != 0) {
-                return -1;
-            }
-            if (cdbg_wait(dbg) != 0) {
-                if (dbg->state == CDBG_STATE_IDLE) {
-                    report_process_exit(dbg);
-                    continue;
-                }
-                return -1;
-            }
-            if (dbg->state == CDBG_STATE_STOPPED) {
-                (void)report_stop(dbg);
-            } else if (dbg->state == CDBG_STATE_IDLE) {
-                report_process_exit(dbg);
-            }
-        } else if (strcmp(cmd, "next") == 0 || strcmp(cmd, "n") == 0) {
-            if (dbg->state == CDBG_STATE_IDLE) {
-                fputs("No process is running\n", stderr);
-                continue;
-            }
-            if (cdbg_next_source_line(dbg) != 0 && dbg->state != CDBG_STATE_IDLE) {
-                return -1;
-            }
-            if (dbg->state == CDBG_STATE_IDLE) {
-                report_process_exit(dbg);
-            }
-        } else if (strcmp(cmd, "up") == 0) {
-            (void)cdbg_frame_up(dbg);
-        } else if (strcmp(cmd, "regs") == 0 || strcmp(cmd, "r") == 0) {
-            if (cdbg_refresh_regs(dbg) != 0) {
-                return -1;
-            }
-            cdbg_print_regs(dbg);
-        } else if (strcmp(cmd, "print") == 0 || strcmp(cmd, "p") == 0 ||
-                   strncmp(cmd, "p/", 2) == 0 || strncmp(cmd, "print/", 6) == 0) {
-            char *rest = strtok(NULL, "\n");
-            cmd_print_from_repl(dbg, cmd, rest);
-        } else if (strcmp(cmd, "set") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_set(dbg, args);
-        } else if (strcmp(cmd, "show") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_show(dbg, args);
-        } else if (strcmp(cmd, "tb") == 0) {
-            (void)cmd_backtrace(dbg);
-        } else if (strcmp(cmd, "leaks") == 0) {
-            (void)cmd_leaks(dbg);
-        } else if (strcmp(cmd, "break") == 0 || strcmp(cmd, "b") == 0) {
-            char *addr_text = strtok(NULL, " \t");
-            if (addr_text == NULL) {
-                fputs("Usage: break <addr|name|file:line|line>\n", stderr);
-            } else {
-                (void)cmd_break(dbg, addr_text);
-            }
-        } else if (strcmp(cmd, "del") == 0 || strcmp(cmd, "delete") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_del(dbg, args);
-        } else if (strcmp(cmd, "watch") == 0) {
-            char *expr = strtok(NULL, "\n");
-            (void)cmd_watch(dbg, expr);
-        } else if (strcmp(cmd, "unwatch") == 0) {
-            char *args = strtok(NULL, "\n");
-            (void)cmd_unwatch(dbg, args);
-        } else if (strcmp(cmd, "dis") == 0) {
-            char *target = strtok(NULL, "\n");
-            (void)cmd_dis(dbg, target);
-        } else if (strcmp(cmd, "list") == 0 || strcmp(cmd, "l") == 0) {
-            char *target = strtok(NULL, "\n");
-            (void)cmd_list(dbg, target);
-        } else if (strcmp(cmd, "lines") == 0) {
-            char *file_filter = strtok(NULL, " \t");
-            (void)cmd_lines(dbg, file_filter);
-        } else if (strcmp(cmd, "lists") == 0) {
-            char *file_filter = strtok(NULL, " \t");
-            cdbg_lineno_print_list(&dbg->lineno, file_filter);
-        } else if (strcmp(cmd, "syms") == 0 || strcmp(cmd, "sym") == 0) {
-            char *name_filter = strtok(NULL, " \t");
-            cdbg_syms_print_list(&dbg->syms, name_filter);
-        } else if (strcmp(cmd, "x") == 0) {
-            char *addr_text = strtok(NULL, " \t");
-            char *count_text = strtok(NULL, " \t");
-            if (addr_text == NULL) {
-                fputs("Usage: x <addr> [count]\n", stderr);
-            } else {
-                (void)cmd_examine(dbg, addr_text, count_text);
-            }
-        } else if (strcmp(cmd, "kill") == 0) {
-            if (dbg->pid <= 0 || dbg->state == CDBG_STATE_IDLE) {
-                fputs("No process is running.\n", stderr);
-            } else {
-                pid_t killed_pid = dbg->pid;
-                (void)stop_debuggee(dbg);
-                printf("Process %d killed.\n", killed_pid);
-            }
-        } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0) {
-            (void)stop_debuggee(dbg);
-            cdbg_lineno_free(&dbg->lineno);
-            cdbg_syms_free(&dbg->syms);
+        cdbg_repl_outcome_t outcome = cdbg_repl_dispatch_line(dbg, trimmed);
+        if (outcome == CDBG_REPL_QUIT) {
             return 0;
-        } else {
-            printf("Unknown command: %s\n", cmd);
+        }
+        if (outcome == CDBG_REPL_FATAL) {
+            return -1;
         }
     }
 
