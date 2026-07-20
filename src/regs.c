@@ -20,7 +20,22 @@ static mach_port_t task_for_traced_pid(pid_t pid)
     return task;
 }
 
-static thread_act_t primary_thread_for_task(mach_port_t task)
+static uint64_t tid_of_thread(thread_act_t thread)
+{
+    thread_identifier_info_data_t info;
+    mach_msg_type_number_t count = THREAD_IDENTIFIER_INFO_COUNT;
+    if (thread_info(thread, THREAD_IDENTIFIER_INFO, (thread_info_t)&info,
+                    &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return info.thread_id;
+}
+
+/* Returns the mach port for thread `tid` (or the task's primary/first
+ * thread if `tid` is CDBG_TID_PRIMARY), deallocating every other thread
+ * port it enumerates along the way. Caller must mach_port_deallocate() the
+ * result. */
+static thread_act_t thread_for_task_tid(mach_port_t task, uint64_t tid)
 {
     thread_act_array_t threads = NULL;
     mach_msg_type_number_t count = 0;
@@ -31,24 +46,99 @@ static thread_act_t primary_thread_for_task(mach_port_t task)
         return MACH_PORT_NULL;
     }
 
-    thread_act_t primary = threads[0];
-    for (mach_msg_type_number_t i = 1; i < count; i++) {
-        mach_port_deallocate(mach_task_self(), threads[i]);
+    thread_act_t found = MACH_PORT_NULL;
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        bool matches = (tid == CDBG_TID_PRIMARY) ? (i == 0)
+                                                  : (tid_of_thread(threads[i]) == tid);
+        if (matches && found == MACH_PORT_NULL) {
+            found = threads[i];
+        } else {
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
     }
     vm_deallocate(mach_task_self(), (vm_address_t)threads,
                   count * sizeof(thread_act_t));
 
-    return primary;
+    if (found == MACH_PORT_NULL) {
+        fprintf(stderr, "No such thread: tid=%llu\n", (unsigned long long)tid);
+    }
+    return found;
 }
 
-int cdbg_regs_get(pid_t pid, cdbg_regs_t *regs)
+int cdbg_threads_list(pid_t pid, cdbg_thread_info_t *out, size_t max_count,
+                       size_t *count_out)
 {
     mach_port_t task = task_for_traced_pid(pid);
     if (task == MACH_PORT_NULL) {
         return -1;
     }
 
-    thread_act_t thread = primary_thread_for_task(task);
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t count = 0;
+    kern_return_t kr = task_threads(task, &threads, &count);
+    mach_port_deallocate(mach_task_self(), task);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "task_threads failed: %s (%d)\n", mach_error_string(kr), kr);
+        return -1;
+    }
+
+    size_t n = count < max_count ? count : max_count;
+    for (size_t i = 0; i < n; i++) {
+        out[i].tid = tid_of_thread(threads[i]);
+        out[i].is_primary = (i == 0);
+    }
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                  count * sizeof(thread_act_t));
+
+    *count_out = n;
+    return 0;
+}
+
+static int suspend_or_resume_thread(pid_t pid, uint64_t tid, bool suspend)
+{
+    mach_port_t task = task_for_traced_pid(pid);
+    if (task == MACH_PORT_NULL) {
+        return -1;
+    }
+
+    thread_act_t thread = thread_for_task_tid(task, tid);
+    mach_port_deallocate(mach_task_self(), task);
+    if (thread == MACH_PORT_NULL) {
+        return -1;
+    }
+
+    kern_return_t kr = suspend ? thread_suspend(thread) : thread_resume(thread);
+    mach_port_deallocate(mach_task_self(), thread);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "%s failed: %s (%d)\n",
+                suspend ? "thread_suspend" : "thread_resume",
+                mach_error_string(kr), kr);
+        return -1;
+    }
+    return 0;
+}
+
+int cdbg_thread_suspend(pid_t pid, uint64_t tid)
+{
+    return suspend_or_resume_thread(pid, tid, true);
+}
+
+int cdbg_thread_resume(pid_t pid, uint64_t tid)
+{
+    return suspend_or_resume_thread(pid, tid, false);
+}
+
+int cdbg_regs_get(pid_t pid, uint64_t tid, cdbg_regs_t *regs)
+{
+    mach_port_t task = task_for_traced_pid(pid);
+    if (task == MACH_PORT_NULL) {
+        return -1;
+    }
+
+    thread_act_t thread = thread_for_task_tid(task, tid);
     mach_port_deallocate(mach_task_self(), task);
     if (thread == MACH_PORT_NULL) {
         return -1;
@@ -82,14 +172,14 @@ int cdbg_regs_get(pid_t pid, cdbg_regs_t *regs)
     return 0;
 }
 
-int cdbg_regs_set(pid_t pid, const cdbg_regs_t *regs)
+int cdbg_regs_set(pid_t pid, uint64_t tid, const cdbg_regs_t *regs)
 {
     mach_port_t task = task_for_traced_pid(pid);
     if (task == MACH_PORT_NULL) {
         return -1;
     }
 
-    thread_act_t thread = primary_thread_for_task(task);
+    thread_act_t thread = thread_for_task_tid(task, tid);
     mach_port_deallocate(mach_task_self(), task);
     if (thread == MACH_PORT_NULL) {
         return -1;
@@ -305,11 +395,11 @@ void cdbg_regs_print(const cdbg_regs_t *regs)
 #endif
 }
 
-static int cdbg_regs_set_fp(pid_t pid, const cdbg_regs_t *regs)
+static int cdbg_regs_set_fp(pid_t pid, uint64_t tid, const cdbg_regs_t *regs)
 {
     mach_port_t task = task_for_traced_pid(pid);
     if (task == MACH_PORT_NULL) return -1;
-    thread_act_t thread = primary_thread_for_task(task);
+    thread_act_t thread = thread_for_task_tid(task, tid);
     mach_port_deallocate(mach_task_self(), task);
     if (thread == MACH_PORT_NULL) return -1;
 
@@ -534,14 +624,14 @@ int cdbg_regs_get_by_name(const cdbg_regs_t *regs, const char *name, uint64_t *o
     return -1;
 }
 
-int cdbg_regs_set_by_name(pid_t pid, cdbg_regs_t *regs, const char *name,
+int cdbg_regs_set_by_name(pid_t pid, uint64_t tid, cdbg_regs_t *regs, const char *name,
                            uint64_t value, bool is_float, double fvalue)
 {
     if (set_gpr_field(regs, name, value) == 0) {
-        return cdbg_regs_set(pid, regs);
+        return cdbg_regs_set(pid, tid, regs);
     }
     if (set_fp_field(regs, name, value, is_float, fvalue) == 0) {
-        return cdbg_regs_set_fp(pid, regs);
+        return cdbg_regs_set_fp(pid, tid, regs);
     }
     return -1;
 }

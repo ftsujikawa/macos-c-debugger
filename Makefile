@@ -33,9 +33,12 @@ TARGET = build/cdbg
 
 all: $(TARGET)
 
-examples: $(TARGET) build/target
+examples: $(TARGET) build/target build/target_threads
 
 build/target: examples/target.c | build
+	$(CC) -g -o $@ $<
+
+build/target_threads: examples/target_threads.c | build
 	$(CC) -g -o $@ $<
 
 $(TARGET): $(OBJS) $(GENOBJS) | build

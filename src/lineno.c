@@ -834,6 +834,27 @@ static int lineno_push(cdbg_lineno_t *ln, uintptr_t addr, uint32_t line,
     return 0;
 }
 
+/* Builds the full path for dwarfdump row file index `file_idx` from the
+ * per-compile-unit `dirs`/`files` tables (file_names[N] + its dir_index,
+ * per DWARF's file-table semantics -- NOT "whichever name: line was most
+ * recently printed", which breaks as soon as a compile unit references
+ * more than one file, e.g. via an inlined header). */
+static void dwarfdump_resolve_path(const str_table_t *dirs, const file_table_t *files,
+                                   unsigned file_idx, char *out, size_t out_len)
+{
+    const char *name = (file_idx < files->count) ? files->items[file_idx] : "";
+    uint64_t dir_index = (file_idx < files->count) ? files->dir_indices[file_idx] : 0;
+    const char *dir = (dir_index < dirs->count) ? dirs->items[dir_index] : "";
+
+    if (name[0] == '\0') {
+        snprintf(out, out_len, "<unknown>");
+    } else if (strchr(name, '/') != NULL || dir[0] == '\0') {
+        snprintf(out, out_len, "%s", name);
+    } else {
+        snprintf(out, out_len, "%s/%s", dir, name);
+    }
+}
+
 static int lineno_load_from_dwarfdump(cdbg_lineno_t *ln, const char *debug_obj)
 {
     char cmd[PATH_MAX + 64];
@@ -847,73 +868,140 @@ static int lineno_load_from_dwarfdump(cdbg_lineno_t *ln, const char *debug_obj)
         return -1;
     }
 
-    char current_dir[CDBG_LINENO_MAX_FILE] = "";
-    char current_file[CDBG_LINENO_MAX_FILE] = "";
+    str_table_t dirs = {0};
+    file_table_t files = {0};
+    bool have_pending_file = false;
+    char pending_name[CDBG_LINENO_MAX_FILE] = "";
     char line_buf[512];
+    int rc = 0;
 
     while (fgets(line_buf, sizeof(line_buf), fp) != NULL) {
-        char *dir_marker = strstr(line_buf, "include_directories");
-        if (dir_marker != NULL) {
-            char *quote = strchr(dir_marker, '"');
-            if (quote != NULL) {
-                char *end = strchr(quote + 1, '"');
-                if (end != NULL) {
-                    size_t len = (size_t)(end - quote - 1);
-                    if (len >= sizeof(current_dir)) {
-                        len = sizeof(current_dir) - 1;
-                    }
-                    memcpy(current_dir, quote + 1, len);
-                    current_dir[len] = '\0';
+        /* Each `debug_line[0x...]` header starts a new compile unit's line
+         * program: its file_names[]/include_directories[] indices are local
+         * to that unit, so the tables must reset or a later CU's file index
+         * N would resolve against an earlier CU's (wrong) table entry. */
+        if (strncmp(line_buf, "debug_line[", 11) == 0) {
+            str_table_free(&dirs);
+            file_table_free(&files);
+            have_pending_file = false;
+            continue;
+        }
+
+        int idx = -1;
+        if (sscanf(line_buf, " include_directories[%d]", &idx) == 1 && idx >= 0) {
+            char *quote = strchr(line_buf, '"');
+            char *end = (quote != NULL) ? strchr(quote + 1, '"') : NULL;
+            char dir[CDBG_LINENO_MAX_FILE] = "";
+            if (end != NULL) {
+                size_t len = (size_t)(end - quote - 1);
+                if (len >= sizeof(dir)) {
+                    len = sizeof(dir) - 1;
+                }
+                memcpy(dir, quote + 1, len);
+                dir[len] = '\0';
+            }
+            while (dirs.count <= (size_t)idx) {
+                if (str_table_push(&dirs, "") != 0) {
+                    rc = -1;
+                    goto done;
+                }
+            }
+            free(dirs.items[idx]);
+            dirs.items[idx] = strdup(dir);
+            continue;
+        }
+
+        if (sscanf(line_buf, " file_names[%d]", &idx) == 1 && idx >= 0) {
+            have_pending_file = true;
+            pending_name[0] = '\0';
+            while (files.count <= (size_t)idx) {
+                if (file_table_push(&files, "", 0) != 0) {
+                    rc = -1;
+                    goto done;
                 }
             }
             continue;
         }
 
-        char *name_marker = strstr(line_buf, "name: \"");
-        if (name_marker != NULL) {
-            char *quote = name_marker + strlen("name: \"");
-            char *end = strchr(quote, '"');
-            if (end != NULL) {
-                size_t len = (size_t)(end - quote);
-                if (len >= sizeof(current_file)) {
-                    len = sizeof(current_file) - 1;
+        if (have_pending_file) {
+            char *name_marker = strstr(line_buf, "name: \"");
+            if (name_marker != NULL) {
+                char *quote = name_marker + strlen("name: \"");
+                char *end = strchr(quote, '"');
+                if (end != NULL) {
+                    size_t len = (size_t)(end - quote);
+                    if (len >= sizeof(pending_name)) {
+                        len = sizeof(pending_name) - 1;
+                    }
+                    memcpy(pending_name, quote, len);
+                    pending_name[len] = '\0';
                 }
-                memcpy(current_file, quote, len);
-                current_file[len] = '\0';
+                continue;
             }
+
+            unsigned int dir_index = 0;
+            if (sscanf(line_buf, " dir_index: %u", &dir_index) == 1) {
+                /* file_names[] entries were pre-populated (possibly out of
+                 * emission order) above; find the most recent one, i.e. the
+                 * last index touched by the "file_names[%d]" match. Since
+                 * dwarfdump emits blocks strictly in increasing index order,
+                 * that is files.count - 1 once padded to at least idx+1. */
+                size_t target = files.count - 1;
+                free(files.items[target]);
+                files.items[target] = strdup(pending_name);
+                files.dir_indices[target] = dir_index;
+                continue;
+            }
+
+            if (strstr(line_buf, "mtime:") != NULL ||
+                strstr(line_buf, "length:") != NULL ||
+                strstr(line_buf, "md5_checksum:") != NULL) {
+                continue;
+            }
+
+            /* Anything else (blank line, the "Address ..." column header,
+             * the "----" separator, or the first "0x..." data row) means
+             * this file_names[] block has ended. Stop treating lines as
+             * file-table attributes and let this line fall through to the
+             * normal row parsing below. */
+            have_pending_file = false;
+        }
+
+        if (line_buf[0] != '0' || line_buf[1] != 'x') {
             continue;
         }
 
         unsigned long long addr = 0;
         unsigned int line_no = 0;
         unsigned int column = 0;
-        if (line_buf[0] != '0' || line_buf[1] != 'x') {
-            continue;
-        }
-        if (sscanf(line_buf, "0x%llx %u %u", &addr, &line_no, &column) != 3) {
+        unsigned int file_idx = 0;
+        if (sscanf(line_buf, "0x%llx %u %u %u", &addr, &line_no, &column, &file_idx) != 4) {
             continue;
         }
 
         char full_path[CDBG_LINENO_MAX_FILE];
-        if (current_file[0] == '\0') {
-            snprintf(full_path, sizeof(full_path), "<unknown>");
-        } else if (strchr(current_file, '/') != NULL || current_dir[0] == '\0') {
-            snprintf(full_path, sizeof(full_path), "%s", current_file);
-        } else {
-            snprintf(full_path, sizeof(full_path), "%s/%s", current_dir, current_file);
-        }
+        dwarfdump_resolve_path(&dirs, &files, file_idx, full_path, sizeof(full_path));
 
         if (lineno_push(ln, (uintptr_t)addr, line_no, column, full_path) != 0) {
-            pclose(fp);
-            return -1;
+            rc = -1;
+            goto done;
         }
     }
 
-    if (current_dir[0] != '\0') {
-        snprintf(ln->comp_dir, sizeof(ln->comp_dir), "%s", current_dir);
+    if (ln->comp_dir[0] == '\0') {
+        for (size_t i = 0; i < dirs.count; i++) {
+            if (dirs.items[i][0] != '\0') {
+                snprintf(ln->comp_dir, sizeof(ln->comp_dir), "%s", dirs.items[i]);
+                break;
+            }
+        }
     }
 
-    return pclose(fp) == 0 && ln->count > 0 ? 0 : -1;
+done:
+    str_table_free(&dirs);
+    file_table_free(&files);
+    int close_rc = pclose(fp);
+    return (rc == 0 && close_rc == 0 && ln->count > 0) ? 0 : -1;
 }
 
 int cdbg_lineno_load(cdbg_lineno_t *ln, const char *executable_path)
@@ -1307,7 +1395,11 @@ int cdbg_lineno_print_source_at_line(const cdbg_lineno_t *ln,
     return lineno_print_source_window(ln, matched_file, line, CDBG_LIST_SOURCE_LINES);
 }
 
-void cdbg_lineno_print_list(const cdbg_lineno_t *ln, const char *file_filter)
+/* Prints every __debug_line row (one per address, `lines`), or only the
+ * first address for each run of consecutive same-line rows (`lists`'s
+ * `group_consecutive_lines`); both grouped and headed per source file. */
+static void print_line_table(const cdbg_lineno_t *ln, const char *file_filter,
+                             bool group_consecutive_lines)
 {
     if (ln->count == 0) {
         puts("No line number information loaded.");
@@ -1336,7 +1428,7 @@ void cdbg_lineno_print_list(const cdbg_lineno_t *ln, const char *file_filter)
             printf("%6s  %-18s  %s\n", "----", "-------", "------");
         }
 
-        if (has_last_line && entry->line == last_line) {
+        if (group_consecutive_lines && has_last_line && entry->line == last_line) {
             continue;
         }
 
@@ -1348,4 +1440,14 @@ void cdbg_lineno_print_list(const cdbg_lineno_t *ln, const char *file_filter)
                (unsigned long)runtime,
                entry->column);
     }
+}
+
+void cdbg_lineno_print_list(const cdbg_lineno_t *ln, const char *file_filter)
+{
+    print_line_table(ln, file_filter, false);
+}
+
+void cdbg_lineno_print_grouped_list(const cdbg_lineno_t *ln, const char *file_filter)
+{
+    print_line_table(ln, file_filter, true);
 }

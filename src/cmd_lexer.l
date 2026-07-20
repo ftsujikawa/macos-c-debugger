@@ -50,6 +50,10 @@
 <INITIAL>"set"                         { BEGIN(ARGSTATE); return SET_TOK; }
 <INITIAL>"show"                        { BEGIN(ARGSTATE); return SHOW_TOK; }
 <INITIAL>"tb"                          { return TB_TOK; }
+<INITIAL>"threads"                     { return THREADS_TOK; }
+<INITIAL>"thread"                      { BEGIN(WORDSTATE); return THREAD_TOK; }
+<INITIAL>"lock"                        { BEGIN(WORDSTATE); return LOCK_TOK; }
+<INITIAL>"unlock"                      { return UNLOCK_TOK; }
 <INITIAL>"leaks"                       { return LEAKS_TOK; }
 <INITIAL>"break"|"b"                   { BEGIN(WORDSTATE); return BREAK_TOK; }
 <INITIAL>"del"|"delete"                { BEGIN(ARGSTATE); return DEL_TOK; }

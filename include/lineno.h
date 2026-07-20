@@ -27,6 +27,7 @@ int  cdbg_lineno_load(cdbg_lineno_t *ln, const char *executable_path);
 int  cdbg_lineno_update_slide(cdbg_lineno_t *ln, pid_t pid);
 void cdbg_lineno_free(cdbg_lineno_t *ln);
 void cdbg_lineno_print_list(const cdbg_lineno_t *ln, const char *file_filter);
+void cdbg_lineno_print_grouped_list(const cdbg_lineno_t *ln, const char *file_filter);
 int  cdbg_lineno_print_source_at_pc(const cdbg_lineno_t *ln, uintptr_t runtime_pc);
 int  cdbg_lineno_print_source_at_line(const cdbg_lineno_t *ln,
                                       const char *file_filter,

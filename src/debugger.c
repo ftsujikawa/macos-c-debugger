@@ -295,7 +295,7 @@ static int run_to_entry_stop(cdbg_t *dbg)
         (void)cdbg_bp_disable(&temp_bp, dbg->pid);
         if (pc > 0) {
             (void)cdbg_regs_set_pc(&dbg->regs, pc - 1);
-            if (cdbg_regs_set(dbg->pid, &dbg->regs) != 0) {
+            if (cdbg_regs_set(dbg->pid, dbg->current_tid, &dbg->regs) != 0) {
                 return -1;
             }
         }
@@ -328,6 +328,9 @@ static int stop_debuggee(cdbg_t *dbg)
 
     dbg->pid = 0;
     dbg->state = CDBG_STATE_IDLE;
+    dbg->current_tid = CDBG_TID_PRIMARY;
+    dbg->thread_lock_active = false;
+    dbg->suspended_tid_count = 0;
     for (size_t i = 0; i < dbg->breakpoint_count; i++) {
         dbg->breakpoints[i].enabled = false;
     }
@@ -360,6 +363,9 @@ int cdbg_run(cdbg_t *dbg, char *const argv[])
     dbg->watchpoint_count = 0;
     memset(dbg->watchpoints, 0, sizeof(dbg->watchpoints));
     memset(&dbg->regs, 0, sizeof(dbg->regs));
+    dbg->current_tid = CDBG_TID_PRIMARY;
+    dbg->thread_lock_active = false;
+    dbg->suspended_tid_count = 0;
     dbg->wait_status = 0;
 
     const char *program = dbg->run_argv[0];
@@ -594,7 +600,7 @@ static int finish_temp_breakpoint(cdbg_t *dbg, cdbg_breakpoint_t *temp_bp)
 
 #if defined(__x86_64__)
     (void)cdbg_regs_set_pc(&dbg->regs, temp_bp->addr);
-    if (cdbg_regs_set(dbg->pid, &dbg->regs) != 0) {
+    if (cdbg_regs_set(dbg->pid, dbg->current_tid, &dbg->regs) != 0) {
         return -1;
     }
 #endif
@@ -1174,7 +1180,7 @@ int cdbg_frame_up(cdbg_t *dbg)
         return -1;
     }
 
-    if (cdbg_regs_set(dbg->pid, &dbg->regs) != 0) {
+    if (cdbg_regs_set(dbg->pid, dbg->current_tid, &dbg->regs) != 0) {
         return -1;
     }
 
@@ -1186,7 +1192,7 @@ int cdbg_frame_up(cdbg_t *dbg)
 
 int cdbg_refresh_regs(cdbg_t *dbg)
 {
-    return cdbg_regs_get(dbg->pid, &dbg->regs);
+    return cdbg_regs_get(dbg->pid, dbg->current_tid, &dbg->regs);
 }
 
 void cdbg_print_regs(const cdbg_t *dbg)
@@ -1218,7 +1224,7 @@ static int handle_breakpoint_hit(cdbg_t *dbg, size_t index)
     uintptr_t pc = cdbg_regs_pc(&dbg->regs);
     if (pc > 0) {
         (void)cdbg_regs_set_pc(&dbg->regs, pc - 1);
-        if (cdbg_regs_set(dbg->pid, &dbg->regs) != 0) {
+        if (cdbg_regs_set(dbg->pid, dbg->current_tid, &dbg->regs) != 0) {
             return -1;
         }
     }
@@ -3107,7 +3113,7 @@ int cmd_set(cdbg_t *dbg, char *args)
         if (cdbg_refresh_regs(dbg) != 0) {
             return -1;
         }
-        if (cdbg_regs_set_by_name(dbg->pid, &dbg->regs, reg_name,
+        if (cdbg_regs_set_by_name(dbg->pid, dbg->current_tid, &dbg->regs, reg_name,
                                    reg_result.value, reg_result.is_float,
                                    reg_result.fvalue) != 0) {
             fprintf(stderr, "Unknown register: %s\n", reg_name);
@@ -3268,6 +3274,201 @@ int cmd_backtrace(cdbg_t *dbg)
     }
 
     return 0;
+}
+
+static bool thread_is_current(const cdbg_t *dbg, const cdbg_thread_info_t *t)
+{
+    if (dbg->current_tid == CDBG_TID_PRIMARY) {
+        return t->is_primary;
+    }
+    return t->tid == dbg->current_tid;
+}
+
+static bool thread_is_locked(const cdbg_t *dbg, const cdbg_thread_info_t *t)
+{
+    return dbg->thread_lock_active && t->tid == dbg->locked_tid;
+}
+
+static void print_thread_line(cdbg_t *dbg, size_t index, const cdbg_thread_info_t *t)
+{
+    printf("%s%s%-4zu tid=0x%-16llx %-9s ",
+           thread_is_current(dbg, t) ? "*" : " ",
+           thread_is_locked(dbg, t) ? "L " : "  ", index,
+           (unsigned long long)t->tid, t->is_primary ? "(primary)" : "");
+
+    cdbg_regs_t regs;
+    if (cdbg_regs_get(dbg->pid, t->tid, &regs) != 0) {
+        puts("(registers unavailable)");
+        return;
+    }
+
+    uintptr_t pc = cdbg_regs_pc(&regs);
+    uintptr_t offset = 0;
+    const cdbg_sym_entry_t *sym = lookup_symbol_for_pc(&dbg->syms, pc, &offset);
+    printf("0x%016lx in %s", (unsigned long)pc, display_sym_name(sym));
+    if (sym != NULL && offset != 0) {
+        printf(" + %lu", (unsigned long)offset);
+    }
+
+    char file[CDBG_LINENO_MAX_FILE];
+    uint32_t line = 0;
+    if (cdbg_lineno_line_at_pc(&dbg->lineno, pc, file, sizeof(file), &line) == 0) {
+        printf(" at %s:%u", file, line);
+    }
+    putchar('\n');
+}
+
+int cmd_threads(cdbg_t *dbg)
+{
+    if (dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running\n", stderr);
+        return -1;
+    }
+
+    cdbg_thread_info_t threads[CDBG_MAX_THREADS];
+    size_t count = 0;
+    if (cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        print_thread_line(dbg, i, &threads[i]);
+    }
+    return 0;
+}
+
+int cmd_thread(cdbg_t *dbg, char *args)
+{
+    if (dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running\n", stderr);
+        return -1;
+    }
+
+    cdbg_thread_info_t threads[CDBG_MAX_THREADS];
+    size_t count = 0;
+    if (cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0) {
+        return -1;
+    }
+
+    if (args != NULL) {
+        args = trim_space(args);
+    }
+    if (args == NULL || args[0] == '\0') {
+        for (size_t i = 0; i < count; i++) {
+            if (thread_is_current(dbg, &threads[i])) {
+                printf("Current thread is #%zu (tid=0x%llx)%s\n", i,
+                       (unsigned long long)threads[i].tid,
+                       threads[i].is_primary ? " (primary)" : "");
+                return 0;
+            }
+        }
+        fputs("No current thread\n", stderr);
+        return -1;
+    }
+
+    uint64_t index = 0;
+    if (parse_u64(args, &index) != 0 || index >= count) {
+        fprintf(stderr, "No thread number %s\n", args);
+        return -1;
+    }
+
+    const cdbg_thread_info_t *t = &threads[index];
+    dbg->current_tid = t->is_primary ? CDBG_TID_PRIMARY : t->tid;
+    if (cdbg_refresh_regs(dbg) != 0) {
+        return -1;
+    }
+
+    printf("Switched to thread #%llu (tid=0x%llx)%s\n",
+           (unsigned long long)index, (unsigned long long)t->tid,
+           t->is_primary ? " (primary)" : "");
+    print_stop_location(dbg, cdbg_regs_pc(&dbg->regs));
+    return 0;
+}
+
+int cmd_lock(cdbg_t *dbg, char *args)
+{
+    if (dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running\n", stderr);
+        return -1;
+    }
+
+    if (args != NULL) {
+        args = trim_space(args);
+    }
+    if (args == NULL || args[0] == '\0') {
+        fputs("Usage: lock <thread-number>\n", stderr);
+        return -1;
+    }
+
+    if (dbg->thread_lock_active) {
+        fputs("Already locked to a thread; run 'unlock' first\n", stderr);
+        return -1;
+    }
+
+    cdbg_thread_info_t threads[CDBG_MAX_THREADS];
+    size_t count = 0;
+    if (cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0) {
+        return -1;
+    }
+
+    uint64_t index = 0;
+    if (parse_u64(args, &index) != 0 || index >= count) {
+        fprintf(stderr, "No thread number %s\n", args);
+        return -1;
+    }
+
+    const cdbg_thread_info_t *target = &threads[index];
+    size_t suspended = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (threads[i].tid == target->tid) {
+            continue;
+        }
+        if (cdbg_thread_suspend(dbg->pid, threads[i].tid) != 0) {
+            for (size_t j = 0; j < suspended; j++) {
+                (void)cdbg_thread_resume(dbg->pid, dbg->suspended_tids[j]);
+            }
+            return -1;
+        }
+        dbg->suspended_tids[suspended++] = threads[i].tid;
+    }
+
+    dbg->thread_lock_active = true;
+    dbg->locked_tid = target->tid;
+    dbg->suspended_tid_count = suspended;
+    dbg->current_tid = target->is_primary ? CDBG_TID_PRIMARY : target->tid;
+    if (cdbg_refresh_regs(dbg) != 0) {
+        return -1;
+    }
+
+    printf("Locked to thread #%llu (tid=0x%llx)%s; %zu other thread(s) suspended\n",
+           (unsigned long long)index, (unsigned long long)target->tid,
+           target->is_primary ? " (primary)" : "", suspended);
+    return 0;
+}
+
+int cmd_unlock(cdbg_t *dbg)
+{
+    if (dbg->state == CDBG_STATE_IDLE) {
+        fputs("No process is running\n", stderr);
+        return -1;
+    }
+
+    if (!dbg->thread_lock_active) {
+        puts("Not locked.");
+        return 0;
+    }
+
+    int rc = 0;
+    for (size_t i = 0; i < dbg->suspended_tid_count; i++) {
+        if (cdbg_thread_resume(dbg->pid, dbg->suspended_tids[i]) != 0) {
+            rc = -1;
+        }
+    }
+
+    dbg->thread_lock_active = false;
+    dbg->suspended_tid_count = 0;
+    puts("Unlocked; all threads resumed.");
+    return rc;
 }
 
 int cmd_run(cdbg_t *dbg, char *args)
@@ -3692,6 +3893,61 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "Show a backtrace of the current call stack.",
         "Prints each frame as: #n  <address>  <function> (if known)\n"
         "Unwinding follows saved FP/LR chains on the stack.\n",
+    },
+    {
+        "Inspection",
+        "threads",
+        "threads",
+        "List the debuggee's threads.",
+        "Prints one line per thread: index, tid, whether it is the process's\n"
+        "primary thread, and its current PC (symbol + source line if known).\n"
+        "The current thread (see 'thread') is marked with '*'; the thread\n"
+        "locked via 'lock' (if any) is marked with 'L'.\n"
+        "\n"
+        "'regs', 'print', 'show locals/args', 'tb', and 'up' all operate on\n"
+        "whichever thread is current, not necessarily the primary thread.\n",
+    },
+    {
+        "Inspection",
+        "thread",
+        "thread [n]",
+        "Show or switch the current thread.",
+        "Without an argument, prints the currently selected thread.\n"
+        "With a thread index (from 'threads'), switches to that thread and\n"
+        "refreshes registers/backtrace/locals to its context.\n"
+        "\n"
+        "Examples:\n"
+        "  threads     List all threads\n"
+        "  thread      Show the current thread\n"
+        "  thread 1    Switch to thread #1\n",
+    },
+    {
+        "Inspection",
+        "lock",
+        "lock <n>",
+        "Suspend every thread except thread <n>, so only it runs.",
+        "Uses thread_suspend() on every other thread (independent of ptrace),\n"
+        "so 'continue'/'step'/'si' only advance the locked thread; the\n"
+        "suspended threads stay frozen even though the process as a whole\n"
+        "is resumed. Also switches the current thread (see 'thread') to <n>.\n"
+        "\n"
+        "The locked thread is marked with 'L' in 'threads' output until\n"
+        "'unlock' is run.\n"
+        "\n"
+        "Only one thread may be locked at a time; run 'unlock' before\n"
+        "locking a different thread.\n"
+        "\n"
+        "Examples:\n"
+        "  threads     Find the thread number to lock\n"
+        "  lock 1      Suspend every thread except #1\n"
+        "  unlock      Resume the suspended threads\n",
+    },
+    {
+        "Inspection",
+        "unlock",
+        "unlock",
+        "Resume threads previously suspended by 'lock'.",
+        "Does nothing (and reports \"Not locked.\") if no 'lock' is active.\n",
     },
     {
         "Inspection",

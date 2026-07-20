@@ -35,7 +35,7 @@ static void cmdyyerror(cdbg_t *dbg, cdbg_repl_outcome_t *out_outcome, const char
 
 %token <str> WORD RESTLINE UNKNOWN_TOK PRINT_TOK
 %token HELP_TOK RUN_TOK CONTINUE_TOK STEP_TOK SI_TOK NEXT_TOK UP_TOK REGS_TOK
-%token SET_TOK SHOW_TOK TB_TOK LEAKS_TOK BREAK_TOK DEL_TOK WATCH_TOK
+%token SET_TOK SHOW_TOK TB_TOK THREADS_TOK THREAD_TOK LOCK_TOK UNLOCK_TOK LEAKS_TOK BREAK_TOK DEL_TOK WATCH_TOK
 %token UNWATCH_TOK DIS_TOK LIST_TOK LINES_TOK LISTS_TOK SYMS_TOK X_TOK
 %token KILL_TOK QUIT_TOK
 
@@ -59,6 +59,12 @@ line:
     | SHOW_TOK                  { (void)cmd_show(dbg, NULL); }
     | SHOW_TOK RESTLINE         { (void)cmd_show(dbg, $2); free($2); }
     | TB_TOK                    { (void)cmd_backtrace(dbg); }
+    | THREADS_TOK                { (void)cmd_threads(dbg); }
+    | THREAD_TOK                 { (void)cmd_thread(dbg, NULL); }
+    | THREAD_TOK WORD            { (void)cmd_thread(dbg, $2); free($2); }
+    | LOCK_TOK                   { fputs("Usage: lock <thread-number>\n", stderr); }
+    | LOCK_TOK WORD              { (void)cmd_lock(dbg, $2); free($2); }
+    | UNLOCK_TOK                 { (void)cmd_unlock(dbg); }
     | LEAKS_TOK                 { (void)cmd_leaks(dbg); }
     | BREAK_TOK                 { fputs("Usage: break <addr|name|file:line|line>\n", stderr); }
     | BREAK_TOK WORD            { (void)cmd_break(dbg, $2); free($2); }
@@ -74,8 +80,8 @@ line:
     | LIST_TOK RESTLINE         { (void)cmd_list(dbg, $2); free($2); }
     | LINES_TOK                  { (void)cmd_lines(dbg, NULL); }
     | LINES_TOK WORD             { (void)cmd_lines(dbg, $2); free($2); }
-    | LISTS_TOK                  { cdbg_lineno_print_list(&dbg->lineno, NULL); }
-    | LISTS_TOK WORD             { cdbg_lineno_print_list(&dbg->lineno, $2); free($2); }
+    | LISTS_TOK                  { cdbg_lineno_print_grouped_list(&dbg->lineno, NULL); }
+    | LISTS_TOK WORD             { cdbg_lineno_print_grouped_list(&dbg->lineno, $2); free($2); }
     | SYMS_TOK                   { cdbg_syms_print_list(&dbg->syms, NULL); }
     | SYMS_TOK WORD              { cdbg_syms_print_list(&dbg->syms, $2); free($2); }
     | X_TOK                     { fputs("Usage: x <addr> [count]\n", stderr); }

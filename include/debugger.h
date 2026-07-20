@@ -43,6 +43,11 @@ typedef struct cdbg {
     cdbg_state_t state;
     int wait_status;
     cdbg_regs_t regs;
+    uint64_t current_tid; /* CDBG_TID_PRIMARY, or a tid from `threads`/`thread` */
+    bool     thread_lock_active;
+    uint64_t locked_tid;                         /* valid iff thread_lock_active */
+    uint64_t suspended_tids[CDBG_MAX_THREADS];    /* threads suspended by `lock`, for `unlock` */
+    size_t   suspended_tid_count;
     cdbg_breakpoint_t breakpoints[CDBG_MAX_BREAKPOINTS];
     size_t breakpoint_count;
     cdbg_watchpoint_t watchpoints[CDBG_MAX_WATCHPOINTS];
