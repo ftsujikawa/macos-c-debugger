@@ -2396,7 +2396,18 @@ typedef enum {
     PRINT_FMT_BIN,
     PRINT_FMT_CHAR,
     PRINT_FMT_STRING,
+    PRINT_FMT_UDEC,
+    PRINT_FMT_ADDR,
+    PRINT_FMT_FLOAT,
+    PRINT_FMT_ZHEX,
 } print_format_t;
+
+/* Forward declarations: defined later in this file, needed by
+ * print_scalar_result_fmt()'s PRINT_FMT_ADDR case (gdb's `/a`). */
+static const cdbg_sym_entry_t *lookup_symbol_for_pc(const cdbg_syms_t *syms,
+                                                    uintptr_t pc,
+                                                    uintptr_t *offset_out);
+static const char *display_sym_name(const cdbg_sym_entry_t *sym);
 
 #define CDBG_MAX_PRINT_STRING 256
 
@@ -2426,6 +2437,18 @@ static print_format_t parse_print_format(char **expr)
         break;
     case 's':
         fmt = PRINT_FMT_STRING;
+        break;
+    case 'u':
+        fmt = PRINT_FMT_UDEC;
+        break;
+    case 'a':
+        fmt = PRINT_FMT_ADDR;
+        break;
+    case 'f':
+        fmt = PRINT_FMT_FLOAT;
+        break;
+    case 'z':
+        fmt = PRINT_FMT_ZHEX;
         break;
     default:
         return PRINT_FMT_DEFAULT;
@@ -2556,6 +2579,51 @@ static void print_scalar_result_fmt(cdbg_t *dbg, const char *label, print_format
             printf("%llu\n", (unsigned long long)value);
         }
         return;
+    case PRINT_FMT_UDEC:
+        printf("%s = ", label);
+        print_type_annotation(dbg, fmt, type);
+        printf("%llu\n", (unsigned long long)value);
+        return;
+    case PRINT_FMT_ZHEX: {
+        unsigned int width = (unsigned int)((size == 0 || size > sizeof(uint64_t)) ?
+                                             sizeof(uint64_t) : size) * 2;
+        printf("%s = ", label);
+        print_type_annotation(dbg, fmt, type);
+        printf("0x%0*llx\n", (int)width, (unsigned long long)value);
+        return;
+    }
+    case PRINT_FMT_FLOAT: {
+        printf("%s = ", label);
+        print_type_annotation(dbg, fmt, type);
+        if (size <= 4) {
+            uint32_t bits = (uint32_t)value;
+            float f;
+            memcpy(&f, &bits, sizeof(f));
+            printf("%.9g\n", (double)f);
+        } else {
+            double d;
+            memcpy(&d, &value, sizeof(d));
+            printf("%.17g\n", d);
+        }
+        return;
+    }
+    case PRINT_FMT_ADDR: {
+        printf("%s = ", label);
+        print_type_annotation(dbg, fmt, type);
+        printf("0x%llx", (unsigned long long)value);
+        uintptr_t offset = 0;
+        const cdbg_sym_entry_t *sym =
+            lookup_symbol_for_pc(&dbg->syms, (uintptr_t)value, &offset);
+        if (sym != NULL) {
+            printf(" <%s", display_sym_name(sym));
+            if (offset != 0) {
+                printf("+%lu", (unsigned long)offset);
+            }
+            putchar('>');
+        }
+        putchar('\n');
+        return;
+    }
     case PRINT_FMT_DEFAULT:
         break;
     }
@@ -3785,14 +3853,18 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "Inspection",
         "print, p",
         "print [/fmt] <expr>",
-        "Evaluate and print an expression. Formats: /d /x /o /t /c /s.",
-        "Format specifiers:\n"
-        "  /d   decimal (default for integers)\n"
+        "Evaluate and print an expression. Formats: /x /d /u /o /t /a /c /f /s /z.",
+        "Format specifiers (same letters as GDB):\n"
         "  /x   hexadecimal\n"
+        "  /d   signed decimal (default for integers)\n"
+        "  /u   unsigned decimal\n"
         "  /o   octal\n"
         "  /t   binary\n"
+        "  /a   address, annotated with <symbol+offset> if resolvable\n"
         "  /c   character\n"
+        "  /f   floating point (reinterprets the value's bits)\n"
         "  /s   C string (dereference as char*)\n"
+        "  /z   hexadecimal, zero-padded to the full width of the type\n"
         "\n"
         "Expression examples:\n"
         "  p x              Variable\n"
