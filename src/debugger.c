@@ -358,6 +358,18 @@ int cdbg_run(cdbg_t *dbg, char *const argv[])
         return -1;
     }
 
+    /* A fresh process has a new ASLR slide and none of the previous
+     * process's trap bytes, so breakpoints can't just survive the wipe
+     * below as-is -- save their original `break` argument and re-resolve
+     * each one against the new process further down (help text promises
+     * "Breakpoints set before 'run' are preserved across restarts"). */
+    size_t saved_bp_count = dbg->breakpoint_count;
+    char saved_bp_specs[CDBG_MAX_BREAKPOINTS][sizeof(dbg->breakpoints[0].spec)];
+    for (size_t i = 0; i < saved_bp_count; i++) {
+        snprintf(saved_bp_specs[i], sizeof(saved_bp_specs[i]), "%s",
+                 dbg->breakpoints[i].spec);
+    }
+
     dbg->breakpoint_count = 0;
     memset(dbg->breakpoints, 0, sizeof(dbg->breakpoints));
     dbg->watchpoint_count = 0;
@@ -391,6 +403,10 @@ int cdbg_run(cdbg_t *dbg, char *const argv[])
     }
     if (dbg->syms.count > 0) {
         (void)cdbg_syms_update_slide(&dbg->syms, dbg->pid);
+    }
+
+    for (size_t i = 0; i < saved_bp_count; i++) {
+        (void)cmd_break(dbg, saved_bp_specs[i]);
     }
 
     print_run_banner(dbg);
@@ -1004,7 +1020,8 @@ static uint64_t get_primary_thread_id(pid_t pid)
 
 static void print_stop_header(const cdbg_t *dbg)
 {
-    uint64_t tid = get_primary_thread_id(dbg->pid);
+    uint64_t tid = dbg->current_tid == CDBG_TID_PRIMARY ? get_primary_thread_id(dbg->pid)
+                                                         : dbg->current_tid;
     if (tid != 0) {
         printf("[PID: %d  TID: %llu]\n",
                (int)dbg->pid, (unsigned long long)tid);
@@ -1019,6 +1036,51 @@ static void print_stop_location(cdbg_t *dbg, uintptr_t pc)
         return;
     }
     print_disassembly_at_pc(dbg, pc);
+}
+
+/* ptrace's PT_STEP only arranges a single-instruction trap on the current
+ * thread; it does not keep other threads of the task suspended while that
+ * happens, so they run for real wall-clock time on every step iteration.
+ * That's usually invisible for a one-shot "si", but "step"/"next" can drive
+ * many iterations internally (e.g. falling back to single-stepping through
+ * an entire dynamically-linked call like pthread_create() when it isn't
+ * recognized as a direct "call" the step-over-call logic can skip with one
+ * temp breakpoint), during which other threads can run for whole seconds,
+ * silently racing ahead. thread_suspend()/thread_resume() are independent of
+ * ptrace (the same primitive the `lock` command uses) and let us pin every
+ * other thread for the duration of one step/next/si, matching gdb's default
+ * all-stop stepping behavior. Skipped if `lock` already suspended everyone
+ * else long-term, to avoid fighting over the same suspend count. */
+static size_t suspend_other_threads_for_step(cdbg_t *dbg, uint64_t *out_tids, size_t max_out)
+{
+    if (dbg->thread_lock_active) {
+        return 0;
+    }
+
+    cdbg_thread_info_t threads[CDBG_MAX_THREADS];
+    size_t count = 0;
+    if (cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0) {
+        return 0;
+    }
+
+    size_t suspended = 0;
+    for (size_t i = 0; i < count && suspended < max_out; i++) {
+        uint64_t tid = threads[i].is_primary ? CDBG_TID_PRIMARY : threads[i].tid;
+        if (tid == dbg->current_tid) {
+            continue;
+        }
+        if (cdbg_thread_suspend(dbg->pid, threads[i].tid) == 0) {
+            out_tids[suspended++] = threads[i].tid;
+        }
+    }
+    return suspended;
+}
+
+static void resume_other_threads_after_step(cdbg_t *dbg, const uint64_t *tids, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        (void)cdbg_thread_resume(dbg->pid, tids[i]);
+    }
 }
 
 int cdbg_step_next_line(cdbg_t *dbg)
@@ -1307,8 +1369,63 @@ static void report_process_exit(cdbg_t *dbg)
     dbg->pid = 0;
 }
 
+/* ptrace's PT_CONTINUE/PT_STEP resume the whole task, and a breakpoint's trap
+ * byte is shared code memory that any thread may hit -- not necessarily
+ * dbg->current_tid. Scan every thread's pc and, if one of them is sitting
+ * on a breakpoint, make it current before we report/handle the stop; a
+ * thread other than current_tid hitting a breakpoint would otherwise be
+ * invisible (report_stop would keep inspecting current_tid's unrelated pc,
+ * e.g. wherever it's blocked in a syscall). */
+/* Hardware watchpoints are per-thread debug-register state, so a thread
+ * created after a watchpoint was set (e.g. via pthread_create()) starts
+ * with that slot unprogrammed and can read/write the watched memory
+ * completely unnoticed. There's no thread-creation notification here, so
+ * the best available fix is to re-push every enabled watchpoint onto every
+ * thread that currently exists each time the debugger regains control --
+ * this can't catch a write made by a thread between its creation and the
+ * next stop, but it does mean the very next stop (breakpoint, Ctrl-C, ...)
+ * brings every thread up to date before the user resumes execution again. */
+static void resync_watchpoints_to_all_threads(cdbg_t *dbg)
+{
+    for (size_t i = 0; i < dbg->watchpoint_count; i++) {
+        const cdbg_watchpoint_t *wp = &dbg->watchpoints[i];
+        if (!wp->enabled) {
+            continue;
+        }
+        (void)cdbg_wp_hw_install(dbg->pid, (int)i, wp->addr, wp->size, wp->mode);
+    }
+}
+
+static void switch_current_tid_to_breakpoint_hit(cdbg_t *dbg)
+{
+    if (dbg->breakpoint_count == 0) {
+        return;
+    }
+
+    cdbg_thread_info_t threads[CDBG_MAX_THREADS];
+    size_t count = 0;
+    if (cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        uint64_t tid = threads[i].is_primary ? CDBG_TID_PRIMARY : threads[i].tid;
+        cdbg_regs_t regs;
+        if (cdbg_regs_get(dbg->pid, tid, &regs) != 0) {
+            continue;
+        }
+        if (cdbg_bp_is_trap(cdbg_regs_pc(&regs), dbg->breakpoints, dbg->breakpoint_count)) {
+            dbg->current_tid = tid;
+            return;
+        }
+    }
+}
+
 static int report_stop(cdbg_t *dbg)
 {
+    resync_watchpoints_to_all_threads(dbg);
+    switch_current_tid_to_breakpoint_hit(dbg);
+
     if (cdbg_refresh_regs(dbg) != 0) {
         return -1;
     }
@@ -3596,26 +3713,31 @@ static int cmd_show_breakpoints(const cdbg_t *dbg)
     printf("%-4s %-4s %-18s  %s\n", "Num", "Enb", "Address", "Location");
     for (size_t i = 0; i < dbg->breakpoint_count; i++) {
         const cdbg_breakpoint_t *bp = &dbg->breakpoints[i];
-        char location[CDBG_LINENO_MAX_FILE + 32] = "<unknown>";
+        char location[CDBG_LINENO_MAX_FILE + 64] = "<unknown>";
+        char symloc[64] = "";
         char file[CDBG_LINENO_MAX_FILE];
         uint32_t line = 0;
 
+        uintptr_t offset = 0;
+        const cdbg_sym_entry_t *sym = lookup_symbol_for_pc(&dbg->syms, bp->addr, &offset);
+        if (sym != NULL) {
+            if (offset == 0) {
+                snprintf(symloc, sizeof(symloc), "%s", display_sym_name(sym));
+            } else {
+                snprintf(symloc, sizeof(symloc), "%s+0x%lx",
+                         display_sym_name(sym), (unsigned long)offset);
+            }
+        }
+
         if (cdbg_lineno_line_at_pc(&dbg->lineno, bp->addr, file, sizeof(file),
                                    &line) == 0) {
-            snprintf(location, sizeof(location), "%s:%u", file, line);
-        } else {
-            uintptr_t offset = 0;
-            const cdbg_sym_entry_t *sym =
-                lookup_symbol_for_pc(&dbg->syms, bp->addr, &offset);
-            if (sym != NULL) {
-                if (offset == 0) {
-                    snprintf(location, sizeof(location), "%s",
-                             display_sym_name(sym));
-                } else {
-                    snprintf(location, sizeof(location), "%s+0x%lx",
-                             display_sym_name(sym), (unsigned long)offset);
-                }
+            if (symloc[0] != '\0') {
+                snprintf(location, sizeof(location), "%s at %s:%u", symloc, file, line);
+            } else {
+                snprintf(location, sizeof(location), "%s:%u", file, line);
             }
+        } else if (symloc[0] != '\0') {
+            snprintf(location, sizeof(location), "%s", symloc);
         }
 
         printf("%-4zu %-4s 0x%016lx  %s\n", i, bp->enabled ? "y" : "n",
@@ -4676,6 +4798,8 @@ int cmd_break(cdbg_t *dbg, const char *target)
     if (cdbg_bp_enable(&dbg->breakpoints[index], dbg->pid, addr) != 0) {
         return -1;
     }
+    snprintf(dbg->breakpoints[index].spec, sizeof(dbg->breakpoints[index].spec),
+             "%s", target);
 
     dbg->breakpoint_count++;
     printf("Breakpoint %zu at %s (0x%lx)\n", index, label, (unsigned long)addr);
@@ -5001,7 +5125,11 @@ cdbg_repl_outcome_t cdbg_repl_cmd_step(cdbg_t *dbg)
         fputs("No process is running\n", stderr);
         return CDBG_REPL_OK;
     }
-    if (cdbg_step_next_line(dbg) != 0 && dbg->state != CDBG_STATE_IDLE) {
+    uint64_t suspended_tids[CDBG_MAX_THREADS];
+    size_t suspended_count = suspend_other_threads_for_step(dbg, suspended_tids, CDBG_MAX_THREADS);
+    int rc = cdbg_step_next_line(dbg);
+    resume_other_threads_after_step(dbg, suspended_tids, suspended_count);
+    if (rc != 0 && dbg->state != CDBG_STATE_IDLE) {
         return CDBG_REPL_FATAL;
     }
     if (dbg->state == CDBG_STATE_IDLE) {
@@ -5016,10 +5144,15 @@ cdbg_repl_outcome_t cdbg_repl_cmd_si(cdbg_t *dbg)
         fputs("No process is running\n", stderr);
         return CDBG_REPL_OK;
     }
-    if (cdbg_single_step(dbg) != 0) {
+    uint64_t suspended_tids[CDBG_MAX_THREADS];
+    size_t suspended_count = suspend_other_threads_for_step(dbg, suspended_tids, CDBG_MAX_THREADS);
+    int step_rc = cdbg_single_step(dbg);
+    int wait_rc = step_rc == 0 ? cdbg_wait(dbg) : -1;
+    resume_other_threads_after_step(dbg, suspended_tids, suspended_count);
+    if (step_rc != 0) {
         return CDBG_REPL_FATAL;
     }
-    if (cdbg_wait(dbg) != 0) {
+    if (wait_rc != 0) {
         if (dbg->state == CDBG_STATE_IDLE) {
             report_process_exit(dbg);
             return CDBG_REPL_OK;
@@ -5040,7 +5173,11 @@ cdbg_repl_outcome_t cdbg_repl_cmd_next(cdbg_t *dbg)
         fputs("No process is running\n", stderr);
         return CDBG_REPL_OK;
     }
-    if (cdbg_next_source_line(dbg) != 0 && dbg->state != CDBG_STATE_IDLE) {
+    uint64_t suspended_tids[CDBG_MAX_THREADS];
+    size_t suspended_count = suspend_other_threads_for_step(dbg, suspended_tids, CDBG_MAX_THREADS);
+    int rc = cdbg_next_source_line(dbg);
+    resume_other_threads_after_step(dbg, suspended_tids, suspended_count);
+    if (rc != 0 && dbg->state != CDBG_STATE_IDLE) {
         return CDBG_REPL_FATAL;
     }
     if (dbg->state == CDBG_STATE_IDLE) {

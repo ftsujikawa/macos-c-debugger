@@ -1,8 +1,8 @@
 CC      = clang
 BISON   = bison
 FLEX    = flex
-CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic -g -Iinclude -Ibuild/gen
-GENCFLAGS = -std=c11 -g -Iinclude -Ibuild/gen -Wno-unused-function -Wno-unused-parameter
+CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic -g -Iinclude -Ibuild/gen -MMD -MP
+GENCFLAGS = -std=c11 -g -Iinclude -Ibuild/gen -Wno-unused-function -Wno-unused-parameter -MMD -MP
 LDFLAGS =
 CODESIGN_IDENTITY ?= -
 ENTITLEMENTS      = cdbg.entitlements
@@ -80,3 +80,8 @@ clean:
 
 run: $(TARGET)
 	./$(TARGET)
+
+# Auto-generated header dependencies (see -MMD -MP above), so editing a
+# header rebuilds every .o that includes it instead of silently linking
+# stale object files with a mismatched struct layout.
+-include $(OBJS:.o=.d) $(GENOBJS:.o=.d)

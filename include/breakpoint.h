@@ -9,6 +9,10 @@ typedef struct cdbg_breakpoint {
     uintptr_t addr;
     uint8_t saved_byte;
     bool enabled;
+    char spec[128]; /* original `break` argument, so `run` can re-resolve and
+                     * re-insert this breakpoint in a freshly spawned process
+                     * (a new process gets a new ASLR slide, and its memory
+                     * doesn't have the previous process's trap byte). */
 } cdbg_breakpoint_t;
 
 int cdbg_bp_enable(cdbg_breakpoint_t *bp, pid_t pid, uintptr_t addr);
