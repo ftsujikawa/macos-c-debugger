@@ -3908,7 +3908,11 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "continue",
         "Resume execution until the next breakpoint or process exit.",
         "Resumes the stopped debuggee and waits for the next stop event.\n"
-        "Stop events: breakpoint hit, signal received, or process exit.\n",
+        "Stop events: breakpoint hit, signal received, or process exit.\n"
+        "In a multi-threaded program, a breakpoint or watchpoint can be hit "
+        "by any thread; the debugger switches the current thread (see "
+        "'thread') to whichever one actually hit it before reporting the "
+        "stop.\n",
     },
     {
         "Execution",
@@ -3917,6 +3921,9 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "Execute one source line, entering function calls.",
         "Steps one source line. If the line contains a function call the\n"
         "debugger enters the callee.\n"
+        "In a multi-threaded program, every other thread is suspended "
+        "(thread_suspend()) for the duration of the step and resumed "
+        "afterward, so they can't race ahead while this one is stepped.\n"
         "Use 'next' to step over calls instead.\n"
         "Use 'si' to step one machine instruction.\n",
     },
@@ -3927,6 +3934,8 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "Execute a single machine instruction.",
         "Useful when there is no source information (e.g. inside a library)\n"
         "or when inspecting compiler-generated code closely.\n"
+        "In a multi-threaded program, every other thread is suspended for "
+        "the duration of this step and resumed afterward.\n"
         "Use 'step' / 'next' for source-level stepping.\n",
     },
     {
@@ -3936,6 +3945,12 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "Execute one source line, stepping over function calls.",
         "Steps one source line. Function calls are executed as a unit;\n"
         "the debugger does not enter the callee.\n"
+        "Stepping over a call not recognized as a direct call (e.g. an\n"
+        "indirect/PLT call into a dynamic library) falls back to plain\n"
+        "instruction-by-instruction stepping, which can take a while.\n"
+        "In a multi-threaded program, every other thread is suspended for\n"
+        "the whole 'next' (however long it takes) and resumed afterward, so\n"
+        "they can't advance while this one is stepped.\n"
         "Use 'step' to step into calls instead.\n",
     },
     {
@@ -4166,7 +4181,8 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "  #n   breakpoint number (used with 'del')\n"
         "  [+]  enabled   [-]  disabled\n"
         "  address\n"
-        "  source location (file:line, if known)\n",
+        "  location: function+offset, source file:line, or both together\n"
+        "  (\"func+0x1a at file.c:12\") when known\n",
     },
     {
         "Breakpoints",
@@ -4209,6 +4225,11 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "to trap writes without single-stepping, so execution runs at full "
         "speed until the watched memory actually changes.\n"
         "\n"
+        "Debug registers are per-thread, so the watchpoint is programmed onto "
+        "every thread that exists when it's set, and re-applied to any thread "
+        "still around at each later stop -- it fires no matter which thread "
+        "touches the watched memory, not only the process's first thread.\n"
+        "\n"
         "Flags (must come before <expr>, in any order):\n"
         "  /r        Also trap on reads, not just writes\n"
         "  /1,/2,/4,/8  Force the watch size in bytes instead of inferring "
@@ -4219,6 +4240,10 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "Up to 4 watchpoints may be active at once (a CPU/OS limit).\n"
         "Values wider than 8 bytes (structs, arrays) only watch the first "
         "8 bytes.\n"
+        "With /r, a read-modify-write access (e.g. 'counter++') can trap on "
+        "the read half before the value has changed; that stop is reported "
+        "as a plain \"Stopped\", not a Watchpoint hit, since nothing differs "
+        "from the last known value yet.\n"
         "\n"
         "Examples:\n"
         "  watch counter        Stop when global/local 'counter' changes\n"
