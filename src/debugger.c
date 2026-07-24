@@ -1050,36 +1050,120 @@ static void print_stop_location(cdbg_t *dbg, uintptr_t pc)
  * ptrace (the same primitive the `lock` command uses) and let us pin every
  * other thread for the duration of one step/next/si, matching gdb's default
  * all-stop stepping behavior. Skipped if `lock` already suspended everyone
- * else long-term, to avoid fighting over the same suspend count. */
-static size_t suspend_other_threads_for_step(cdbg_t *dbg, uint64_t *out_tids, size_t max_out)
+ * else long-term, to avoid fighting over the same suspend count.
+ *
+ * The primary thread is never suspended by this guard, regardless of
+ * current_tid: PT_STEP/PT_CONTINUE on this codebase's plain-ptrace design
+ * always operate on the process's original (primary) thread context, not on
+ * whichever thread cdbg_regs_* calls have been aimed at via current_tid (a
+ * single-instruction step while "focused" on a non-primary thread, e.g.
+ * right after its own breakpoint switched current_tid there, actually single-
+ * steps the primary thread regardless -- confirmed by watching the debuggee
+ * land inside libsystem_kernel.dylib at a syscall return, not anywhere in the
+ * selected thread's own code). Suspending the primary thread in that
+ * situation doesn't just give a confusing result: since it's the thread
+ * PT_STEP silently operates on, freezing it means the single-step trap this
+ * codebase is waiting for can never fire, and waitpid() hangs forever. There
+ * is no known fix for actually single-stepping an arbitrary thread with this
+ * ptrace-based design short of injecting the hardware trap flag through Mach
+ * thread_set_state and handling it via exception ports instead of ptrace, so
+ * for now the REPL command handlers warn instead when current_tid isn't the
+ * primary thread.
+ *
+ * A thread created *during* a step (e.g. pthread_create() completing partway
+ * through the single-step fallback above) isn't caught by one suspend-all
+ * pass taken before the loop starts, since it doesn't exist yet at that
+ * point. If left running, it can execute far enough to hit its own
+ * breakpoint while ptrace is specifically waiting on the PT_STEP's
+ * single-instruction trap on a different thread -- observed to wedge
+ * waitpid() forever (it never returns), not merely let the new thread race
+ * ahead. cdbg_step_thread_guard_catch_up() re-scans for and suspends any
+ * such newly appeared thread; callers invoke it once per loop iteration so
+ * the gap is at most one single-step wide. */
+typedef struct cdbg_step_thread_guard {
+    uint64_t tids[CDBG_MAX_THREADS];
+    size_t count;
+} cdbg_step_thread_guard_t;
+
+static void step_thread_guard_catch_up(cdbg_t *dbg, cdbg_step_thread_guard_t *guard)
 {
     if (dbg->thread_lock_active) {
-        return 0;
+        return;
     }
 
     cdbg_thread_info_t threads[CDBG_MAX_THREADS];
     size_t count = 0;
     if (cdbg_threads_list(dbg->pid, threads, CDBG_MAX_THREADS, &count) != 0) {
-        return 0;
+        return;
     }
 
-    size_t suspended = 0;
-    for (size_t i = 0; i < count && suspended < max_out; i++) {
-        uint64_t tid = threads[i].is_primary ? CDBG_TID_PRIMARY : threads[i].tid;
+    for (size_t i = 0; i < count && guard->count < CDBG_MAX_THREADS; i++) {
+        if (threads[i].is_primary) {
+            continue;
+        }
+        uint64_t tid = threads[i].tid;
         if (tid == dbg->current_tid) {
             continue;
         }
-        if (cdbg_thread_suspend(dbg->pid, threads[i].tid) == 0) {
-            out_tids[suspended++] = threads[i].tid;
+
+        bool already_suspended = false;
+        for (size_t j = 0; j < guard->count; j++) {
+            if (guard->tids[j] == tid) {
+                already_suspended = true;
+                break;
+            }
+        }
+        if (already_suspended) {
+            continue;
+        }
+
+        if (cdbg_thread_suspend(dbg->pid, tid) == 0) {
+            guard->tids[guard->count++] = tid;
         }
     }
-    return suspended;
 }
 
-static void resume_other_threads_after_step(cdbg_t *dbg, const uint64_t *tids, size_t count)
+/* Refuses "step"/"si"/"next" while current_tid isn't the primary thread.
+ * PT_STEP on this codebase's plain-ptrace design always arms its single-
+ * instruction trap against the process's primary thread, not current_tid --
+ * so stepping while "focused" on another thread was found to sometimes
+ * silently step the wrong thread, and sometimes (observed via `sample`
+ * stack traces, non-deterministically -- e.g. depending on exactly which
+ * thread the kernel currently has loaded as the traced context) leave
+ * waitpid() blocked forever waiting for a trap that was never going to
+ * arrive on the selected thread. A one-time warning was tried first and
+ * wasn't enough, since the hang risk doesn't go away just because the user
+ * has already seen the note once -- refusing outright is the only way to
+ * guarantee the REPL doesn't wedge. `continue`/breakpoints/watchpoints are
+ * unaffected by any of this (they resume/trap on the whole task, not a
+ * single ptrace-selected thread), so switching focus to inspect another
+ * thread's state is still fully supported; only single-instruction
+ * stepping is restricted to the primary thread. */
+static bool require_primary_thread_for_step(const cdbg_t *dbg)
 {
-    for (size_t i = 0; i < count; i++) {
-        (void)cdbg_thread_resume(dbg->pid, tids[i]);
+    if (dbg->current_tid != CDBG_TID_PRIMARY) {
+        fputs("Cannot single-step: the current thread is not the primary "
+              "thread. PT_STEP always steps the primary thread regardless "
+              "of which thread is selected, which can silently step the "
+              "wrong thread or hang waiting for a trap that never arrives. "
+              "Run 'thread 0' to switch back to the primary thread first "
+              "(see 'help step').\n",
+              stderr);
+        return false;
+    }
+    return true;
+}
+
+static void step_thread_guard_begin(cdbg_t *dbg, cdbg_step_thread_guard_t *guard)
+{
+    guard->count = 0;
+    step_thread_guard_catch_up(dbg, guard);
+}
+
+static void step_thread_guard_end(cdbg_t *dbg, const cdbg_step_thread_guard_t *guard)
+{
+    for (size_t i = 0; i < guard->count; i++) {
+        (void)cdbg_thread_resume(dbg->pid, guard->tids[i]);
     }
 }
 
@@ -1106,31 +1190,41 @@ int cdbg_step_next_line(cdbg_t *dbg)
         return 0;
     }
 
+    cdbg_step_thread_guard_t guard;
+    step_thread_guard_begin(dbg, &guard);
+    int rc = 0;
+
     for (unsigned int i = 0; i < CDBG_MAX_STEP_ITERATIONS; i++) {
+        step_thread_guard_catch_up(dbg, &guard);
+
         if (cdbg_single_step(dbg) != 0) {
-            return -1;
+            rc = -1;
+            goto done;
         }
         if (cdbg_wait(dbg) != 0) {
-            return dbg->state == CDBG_STATE_IDLE ? 0 : -1;
+            rc = dbg->state == CDBG_STATE_IDLE ? 0 : -1;
+            goto done;
         }
         if (dbg->state != CDBG_STATE_STOPPED) {
-            return 0;
+            goto done;
         }
 
         if (cdbg_refresh_regs(dbg) != 0) {
-            return -1;
+            rc = -1;
+            goto done;
         }
 
         pc = cdbg_regs_pc(&dbg->regs);
         if (cdbg_bp_is_trap(pc, dbg->breakpoints, dbg->breakpoint_count)) {
-            return report_stop(dbg);
+            rc = report_stop(dbg);
+            goto done;
         }
 
         int wp_hit = find_watchpoint_hit(dbg);
         if (wp_hit >= 0) {
             print_stop_header(dbg);
             report_watchpoint_hit(dbg, (size_t)wp_hit);
-            return 0;
+            goto done;
         }
 
         char cur_file[CDBG_LINENO_MAX_FILE];
@@ -1144,12 +1238,16 @@ int cdbg_step_next_line(cdbg_t *dbg)
             print_stop_header(dbg);
             printf("Stopped (pc=0x%lx)\n", (unsigned long)pc);
             print_stop_location(dbg, pc);
-            return 0;
+            goto done;
         }
     }
 
     fputs("Step limit exceeded\n", stderr);
-    return -1;
+    rc = -1;
+
+done:
+    step_thread_guard_end(dbg, &guard);
+    return rc;
 }
 
 int cdbg_next_source_line(cdbg_t *dbg)
@@ -1175,41 +1273,52 @@ int cdbg_next_source_line(cdbg_t *dbg)
         return 0;
     }
 
+    cdbg_step_thread_guard_t guard;
+    step_thread_guard_begin(dbg, &guard);
+    int rc = 0;
+
     for (unsigned int i = 0; i < CDBG_MAX_STEP_ITERATIONS; i++) {
+        step_thread_guard_catch_up(dbg, &guard);
+
         uintptr_t return_addr = 0;
         if (call_return_address(dbg, pc, &return_addr) == 0) {
             if (step_over_call(dbg, return_addr) != 0) {
-                return -1;
+                rc = -1;
+                goto done;
             }
             if (dbg->state != CDBG_STATE_STOPPED) {
-                return 0;
+                goto done;
             }
         } else {
             if (cdbg_single_step(dbg) != 0) {
-                return -1;
+                rc = -1;
+                goto done;
             }
             if (cdbg_wait(dbg) != 0) {
-                return dbg->state == CDBG_STATE_IDLE ? 0 : -1;
+                rc = dbg->state == CDBG_STATE_IDLE ? 0 : -1;
+                goto done;
             }
             if (dbg->state != CDBG_STATE_STOPPED) {
-                return 0;
+                goto done;
             }
         }
 
         if (cdbg_refresh_regs(dbg) != 0) {
-            return -1;
+            rc = -1;
+            goto done;
         }
 
         pc = cdbg_regs_pc(&dbg->regs);
         if (cdbg_bp_is_trap(pc, dbg->breakpoints, dbg->breakpoint_count)) {
-            return report_stop(dbg);
+            rc = report_stop(dbg);
+            goto done;
         }
 
         int wp_hit = find_watchpoint_hit(dbg);
         if (wp_hit >= 0) {
             print_stop_header(dbg);
             report_watchpoint_hit(dbg, (size_t)wp_hit);
-            return 0;
+            goto done;
         }
 
         char cur_file[CDBG_LINENO_MAX_FILE];
@@ -1223,12 +1332,16 @@ int cdbg_next_source_line(cdbg_t *dbg)
             print_stop_header(dbg);
             printf("Stopped (pc=0x%lx)\n", (unsigned long)pc);
             print_stop_location(dbg, pc);
-            return 0;
+            goto done;
         }
     }
 
     fputs("Step limit exceeded\n", stderr);
-    return -1;
+    rc = -1;
+
+done:
+    step_thread_guard_end(dbg, &guard);
+    return rc;
 }
 
 int cdbg_frame_up(cdbg_t *dbg)
@@ -3924,6 +4037,10 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "In a multi-threaded program, every other thread is suspended "
         "(thread_suspend()) for the duration of the step and resumed "
         "afterward, so they can't race ahead while this one is stepped.\n"
+        "Requires the primary thread to be current (see 'thread'): PT_STEP\n"
+        "always steps the primary thread regardless of which thread is\n"
+        "selected, which can silently step the wrong thread or hang. Run\n"
+        "'thread 0' first if a different thread is currently selected.\n"
         "Use 'next' to step over calls instead.\n"
         "Use 'si' to step one machine instruction.\n",
     },
@@ -3936,6 +4053,10 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "or when inspecting compiler-generated code closely.\n"
         "In a multi-threaded program, every other thread is suspended for "
         "the duration of this step and resumed afterward.\n"
+        "Requires the primary thread to be current (see 'thread'): PT_STEP\n"
+        "always steps the primary thread regardless of which thread is\n"
+        "selected, which can silently step the wrong thread or hang. Run\n"
+        "'thread 0' first if a different thread is currently selected.\n"
         "Use 'step' / 'next' for source-level stepping.\n",
     },
     {
@@ -3951,6 +4072,10 @@ static const cdbg_help_entry_t k_help_entries[] = {
         "In a multi-threaded program, every other thread is suspended for\n"
         "the whole 'next' (however long it takes) and resumed afterward, so\n"
         "they can't advance while this one is stepped.\n"
+        "Requires the primary thread to be current (see 'thread'): PT_STEP\n"
+        "always steps the primary thread regardless of which thread is\n"
+        "selected, which can silently step the wrong thread or hang. Run\n"
+        "'thread 0' first if a different thread is currently selected.\n"
         "Use 'step' to step into calls instead.\n",
     },
     {
@@ -5150,10 +5275,12 @@ cdbg_repl_outcome_t cdbg_repl_cmd_step(cdbg_t *dbg)
         fputs("No process is running\n", stderr);
         return CDBG_REPL_OK;
     }
-    uint64_t suspended_tids[CDBG_MAX_THREADS];
-    size_t suspended_count = suspend_other_threads_for_step(dbg, suspended_tids, CDBG_MAX_THREADS);
+    if (!require_primary_thread_for_step(dbg)) {
+        return CDBG_REPL_OK;
+    }
+    /* cdbg_step_next_line() suspends other threads (and catches up on any
+     * created mid-step) for its own duration; no wrapping needed here. */
     int rc = cdbg_step_next_line(dbg);
-    resume_other_threads_after_step(dbg, suspended_tids, suspended_count);
     if (rc != 0 && dbg->state != CDBG_STATE_IDLE) {
         return CDBG_REPL_FATAL;
     }
@@ -5169,11 +5296,17 @@ cdbg_repl_outcome_t cdbg_repl_cmd_si(cdbg_t *dbg)
         fputs("No process is running\n", stderr);
         return CDBG_REPL_OK;
     }
-    uint64_t suspended_tids[CDBG_MAX_THREADS];
-    size_t suspended_count = suspend_other_threads_for_step(dbg, suspended_tids, CDBG_MAX_THREADS);
+    if (!require_primary_thread_for_step(dbg)) {
+        return CDBG_REPL_OK;
+    }
+    /* Single instruction only, so the thread-creation race that needs
+     * step_thread_guard_catch_up() mid-loop for "step"/"next" can't open up
+     * here; one begin/end pair around the single step is enough. */
+    cdbg_step_thread_guard_t guard;
+    step_thread_guard_begin(dbg, &guard);
     int step_rc = cdbg_single_step(dbg);
     int wait_rc = step_rc == 0 ? cdbg_wait(dbg) : -1;
-    resume_other_threads_after_step(dbg, suspended_tids, suspended_count);
+    step_thread_guard_end(dbg, &guard);
     if (step_rc != 0) {
         return CDBG_REPL_FATAL;
     }
@@ -5198,10 +5331,12 @@ cdbg_repl_outcome_t cdbg_repl_cmd_next(cdbg_t *dbg)
         fputs("No process is running\n", stderr);
         return CDBG_REPL_OK;
     }
-    uint64_t suspended_tids[CDBG_MAX_THREADS];
-    size_t suspended_count = suspend_other_threads_for_step(dbg, suspended_tids, CDBG_MAX_THREADS);
+    if (!require_primary_thread_for_step(dbg)) {
+        return CDBG_REPL_OK;
+    }
+    /* cdbg_next_source_line() suspends other threads (and catches up on any
+     * created mid-step) for its own duration; no wrapping needed here. */
     int rc = cdbg_next_source_line(dbg);
-    resume_other_threads_after_step(dbg, suspended_tids, suspended_count);
     if (rc != 0 && dbg->state != CDBG_STATE_IDLE) {
         return CDBG_REPL_FATAL;
     }
