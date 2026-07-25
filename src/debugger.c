@@ -2979,7 +2979,7 @@ static int print_array_element_value(cdbg_t *dbg, const cdbg_var_info_t *var,
 
     if (is_struct) {
         print_type_annotation(dbg, PRINT_FMT_DEFAULT, var->element_type);
-        return print_struct_element(dbg, elem_addr, members, member_count, false);
+        return print_struct_element(dbg, elem_addr, members, member_count, dbg->print_pretty);
     }
 
     uint64_t value = 0;
